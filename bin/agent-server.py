@@ -304,6 +304,66 @@ if not log.handlers:
 # Regex patterns
 THINKING_BLOCK_RE = re.compile(r"<thinking>(.*?)</thinking>", re.DOTALL)
 
+# Silence-announcement suppression (2026-09-02, Amos flagged this from
+# outside: 12 of Marvin's last 13 #agent-chat messages were real posts
+# explaining a decision NOT to reply — "Not addressed to me — that ping is
+# Amos's ID. No reply.", "(no output — #agent-chat remains under Ian's
+# standing pause)", "Sitting this one out...". reply_gate.py's own docstring
+# already states the intended rule in prose: "Silence should be the normal
+# state between two agents — it means nothing is needed." The gap is that
+# nothing in the CODE enforces it. `pending_final and channel_id != "0"` at
+# the post_to_discord call site posts anything non-empty, with no concept of
+# "this turn's answer IS silence, not a message about silence."
+#
+# Two layers, cheapest first:
+#   1. PASS_SENTINEL_RE — an explicit, forward-looking convention (matches
+#      Amos's own side's identical fix, same day): a reply that opens or
+#      closes with a bare, all-caps PASS is suppressed outright. Requires
+#      the model to actually say PASS, which is a prompt-level change this
+#      PR does not make — the check is here so that once it does, it works.
+#   2. SILENCE_ANNOUNCEMENT_RE — a heuristic net for the CURRENT phrasing,
+#      built directly from the 12 real examples above, not a general
+#      sentiment classifier. Three shapes only, each deliberately narrow
+#      to avoid catching a real answer that happens to share an opening
+#      phrase (e.g. "That mention resolves to a real question worth
+#      answering" must NOT be suppressed — it's an actual reply):
+#        (a) the entire message is one parenthetical aside (`(no
+#            reply...)`, optionally wrapped in `*...*` for italics — 6 of
+#            12 real examples were exactly this shape);
+#        (b) the message opens with "Not addressed to me" / "Not my
+#            mention" / "Not mine to take" / "Sitting this one out" —
+#            phrases that, in this exact leading position, essentially
+#            only ever mean "declining to answer";
+#        (c) the message opens with a mention-resolution phrase ("That
+#            mention resolves to...", "Same reason as...") AND contains an
+#            explicit "not me"/"not mine"/"holding"/"staying quiet"
+#            nearby (within ~100 chars) — these two openers are NOT
+#            silence-specific on their own (a real answer could start
+#            "That mention resolves to a real question..."), so they only
+#            count combined with an actual negation, not on the opener
+#            alone.
+#      This is a stopgap net for existing behavior, not a substitute for
+#      #1 — expect to delete this once the model reliably emits PASS
+#      instead.
+PASS_SENTINEL_RE = re.compile(r"(^PASS\b|\bPASS[.!?]*$)")
+SILENCE_ANNOUNCEMENT_RE = re.compile(
+    r"^\*?\(.*\)\*?$"                                              # (a) whole message is a parenthetical aside
+    r"|^(Not (my mention|mine to take|addressed to me)"           # (b) unambiguous leading phrases
+    r"|Sitting this one out)"
+    r"|^(That mention resolves to|Same reason as)"                # (c) opener ...
+    r".{0,100}?\b(not (me|mine)|holding|hold off|standing down|staying quiet|sitting? out)\b",  # ... + nearby negation, combined only
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def is_silence_announcement(text: str) -> bool:
+    """True if `text` is a turn explaining that it decided not to reply,
+    rather than an actual reply. See the comment above PASS_SENTINEL_RE."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    return bool(PASS_SENTINEL_RE.search(stripped) or SILENCE_ANNOUNCEMENT_RE.match(stripped))
+
 # Singleton-instance guard (2026-08-07) — see the matching guard in
 # relay.py / scheduler.py for the full incident writeup
 # (agent-server-duplicate-process-incident.md). agent-server.py already
@@ -3177,8 +3237,20 @@ async def process_agent_queue(agent: str):
             # turn. discord_msg_id starts as whatever last posted during
             # streaming, so history still gets a real message ID even on turns
             # where this post is skipped.
-            if pending_final and channel_id != "0":
+            #
+            # is_silence_announcement() (2026-09-02): a non-empty pending_final
+            # is not automatically a real answer — a turn deciding "not mine
+            # to answer" is a decision, and posting that decision is exactly
+            # the failure mode reply_gate.py's docstring already warns
+            # against ("Silence should be the normal state between two
+            # agents"). See the comment above PASS_SENTINEL_RE.
+            if pending_final and channel_id != "0" and not is_silence_announcement(pending_final):
                 discord_msg_id = await post_to_discord(agent, channel_id, pending_final)
+            elif pending_final and is_silence_announcement(pending_final):
+                log.info(
+                    "suppressing silence-announcement post (channel=%s): %r",
+                    channel_id, pending_final[:200],
+                )
 
             # Voice-presence, Phase 1 (2026-09-01, task-1788226029): score
             # this turn's full reply against voice.md's register via
