@@ -21,7 +21,7 @@ def test_peer_mention_drops_immediately_without_scoring():
     msg = GateMessage(
         channel_id="c_agent_chat",
         author_id="user_ryan",
-        content="<@1542285964213358633> do you have access to Ian's heart of gold repo",
+        content="<@999999999999999999> do you have access to Ian's heart of gold repo",
         mentions_self=False,
         mentions_other=True,
     )

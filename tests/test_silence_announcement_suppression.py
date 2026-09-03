@@ -50,14 +50,14 @@ def test_extracts_cleanly():
 # 13th of Marvin's last 13 was a real answer — a ```handoff envelope with
 # an actual "aerial-impressions" response — deliberately excluded here.)
 REAL_SILENCE_EXAMPLES = [
-    "Not mine to take — that ping is addressed to `<@1542285964213358633>`, which isn't Marvin's ID.",
+    "Not mine to take — that ping is addressed to `<@999999999999999999>`, which isn't Marvin's ID.",
     "Not addressed to me — that ping is Amos's ID. No reply.",
     "*(intentional: this thread's ping is Amos's ID, not mine — logged the placeholder-text problem to task-1788365086 instead of repeating it in chat)*",
     "*(no reply — that ping is addressed to Amos's ID, not mine; not answering on his behalf)*",
     "*(no message sent to #agent-chat — this thread is design/feature work, not the token-burn diagnosis carve-out, so it stays under Ian's standing pause; logged to task-1788204155 for follow-up once he unblocks it)*",
     "*(no reply sent — this is Amos's handoff to answer, not mine; #agent-chat remains under Ian's standing pause and this thread doesn't fall under the in-scope diagnosis carve-out)*",
     "*(no output — #agent-chat remains under Ian's standing pause, reaffirmed 15:54 today)*",
-    "That mention resolves to Zero (`1542285964213358633`), Ryan's own bot — not me. This turn's not mine to answer; staying quiet here per the identity-check rule that bit me before.",
+    "That mention resolves to Zero (`999999999999999999`), Ryan's own bot — not me. This turn's not mine to answer; staying quiet here per the identity-check rule that bit me before.",
     "Not my mention — that ID isn't me. Holding regardless, per Ian's standing instruction in #general to sit out agent-chat right now.",
     "Not addressed to me — `to: Amos` in the handoff — and still holding on Ian's instruction regardless. No action here.",
     "Same reason as a minute ago — Ian's asked me to hold off in agent-chat while he needs the tokens elsewhere, that includes role-mention wakes. Not a technical gap on the tag itself, just standing down as instructed.",
