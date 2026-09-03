@@ -10,6 +10,16 @@ rate_limit_info payloads instead of just checking the source shape.
 Nothing in this module starts the server at import time — main()/startup()
 are only called from `if __name__ == "__main__"` / app.on_startup, neither
 of which fires on import.
+
+2026-09-03 (task-1788454188): agent_rate_limits went from a flat
+Dict[agent, info] to Dict[agent, Dict[rate_limit_type, info]] so a
+seven_day reading no longer clobbers a five_hour one (see
+_rate_limit_primary() in agent-server.py). These tests only ever
+populate a single window per agent, so _set_rl() below wraps each
+`info` dict under its own rateLimitType (or "unknown" if the payload
+doesn't have one) — is_rate_limit_paused/is_rate_limit_warning read
+through _rate_limit_primary(), which with only one window present just
+returns that window, preserving the exact behavior these tests pin.
 """
 
 import pytest
@@ -20,6 +30,13 @@ from conftest import import_script
 @pytest.fixture
 def agent_server():
     return import_script("agent-server")
+
+
+def _set_rl(agent_server, agent, info):
+    """Populate agent_rate_limits with a single window for `agent`,
+    matching the nested Dict[agent, Dict[rate_limit_type, info]] shape
+    _rate_limit_primary() reads (task-1788454188)."""
+    agent_server.agent_rate_limits[agent] = {info.get("rateLimitType", "unknown"): dict(info)}
 
 
 # Simulated Anthropic rate_limit_info payloads, matching the real shape
@@ -54,7 +71,7 @@ def agent_server():
     ("empty/missing info (e.g. right after startup)", {}, False),
 ])
 def test_is_rate_limit_paused(agent_server, label, info, expected):
-    agent_server.agent_rate_limits["TestAgent"] = info
+    _set_rl(agent_server, "TestAgent", info)
     assert agent_server.is_rate_limit_paused("TestAgent") is expected, label
 
 
@@ -68,7 +85,7 @@ def test_is_rate_limit_paused(agent_server, label, info, expected):
     ("empty/missing info", {}, False),
 ])
 def test_is_rate_limit_warning(agent_server, label, info, expected):
-    agent_server.agent_rate_limits["TestAgent"] = info
+    _set_rl(agent_server, "TestAgent", info)
     assert agent_server.is_rate_limit_warning("TestAgent") is expected, label
 
 
@@ -76,7 +93,7 @@ def test_warning_does_not_imply_paused(agent_server):
     """Core of the 2026-08-08 fix: crossing Anthropic's ~90% warning
     status must NOT hold the queue by itself. Only the 97% utilization
     threshold does."""
-    agent_server.agent_rate_limits["TestAgent"] = {"status": "allowed_warning", "rateLimitType": "five_hour", "utilization": 0.91}
+    _set_rl(agent_server, "TestAgent", {"status": "allowed_warning", "rateLimitType": "five_hour", "utilization": 0.91})
     assert agent_server.is_rate_limit_warning("TestAgent") is True
     assert agent_server.is_rate_limit_paused("TestAgent") is False
 
@@ -89,7 +106,7 @@ def test_utilization_key_present_but_none_does_not_crash(agent_server):
     exactly this shape and briefly took down check_queued_acks() /
     process_agent_queue() with 'None >= float' on the first restart after
     this fix shipped. Must resolve to falsy, not raise."""
-    agent_server.agent_rate_limits["TestAgent"] = {"status": "allowed", "utilization": None}
+    _set_rl(agent_server, "TestAgent", {"status": "allowed", "utilization": None})
     assert agent_server.is_rate_limit_warning("TestAgent") is False
     assert agent_server.is_rate_limit_paused("TestAgent") is False
 
@@ -102,10 +119,10 @@ def test_rejected_status_hard_pauses_even_without_utilization(agent_server):
     request was ALREADY denied — stronger than "allowed_warning" — so it
     must hard-pause on its own, not rely on a utilization number that
     frequently isn't there."""
-    agent_server.agent_rate_limits["TestAgent"] = {
+    _set_rl(agent_server, "TestAgent", {
         "status": "rejected", "rateLimitType": "five_hour",
         "overageStatus": "rejected", "isUsingOverage": False,
-    }
+    })
     assert agent_server.is_rate_limit_warning("TestAgent") is True
     assert agent_server.is_rate_limit_paused("TestAgent") is True
 
@@ -114,8 +131,36 @@ def test_rejected_status_pauses_regardless_of_low_utilization(agent_server):
     """Even if a stray/incorrect low utilization number ever showed up
     alongside a rejection, the rejection itself is definitive — it must
     still pause."""
-    agent_server.agent_rate_limits["TestAgent"] = {"status": "rejected", "utilization": 0.1}
+    _set_rl(agent_server, "TestAgent", {"status": "rejected", "utilization": 0.1})
     assert agent_server.is_rate_limit_paused("TestAgent") is True
+
+
+def test_rejected_status_wins_over_a_higher_utilization_window():
+    """New in 2026-09-03 (task-1788454188): with two windows tracked at
+    once, _rate_limit_primary() must pick a rejected window over a
+    merely-high-utilization one, even though the selection rule
+    otherwise picks by max utilization — 'already denied' is a stronger
+    signal than any utilization number."""
+    agent_server = import_script("agent-server")
+    agent_server.agent_rate_limits["TestAgent"] = {
+        "five_hour": {"status": "rejected", "rateLimitType": "five_hour", "utilization": 0.5},
+        "seven_day": {"status": "allowed", "rateLimitType": "seven_day", "utilization": 0.99},
+    }
+    assert agent_server.is_rate_limit_paused("TestAgent") is True
+    primary = agent_server._rate_limit_primary("TestAgent")
+    assert primary["rateLimitType"] == "five_hour"
+
+
+def test_primary_picks_higher_utilization_window_absent_rejection():
+    """Two windows, neither rejected — the one closer to the pause
+    threshold governs the single-value gates."""
+    agent_server = import_script("agent-server")
+    agent_server.agent_rate_limits["TestAgent"] = {
+        "five_hour": {"status": "allowed", "rateLimitType": "five_hour", "utilization": 0.2},
+        "seven_day": {"status": "allowed", "rateLimitType": "seven_day", "utilization": 0.6},
+    }
+    primary = agent_server._rate_limit_primary("TestAgent")
+    assert primary["rateLimitType"] == "seven_day"
 
 
 @pytest.mark.asyncio
@@ -128,11 +173,11 @@ async def test_maybe_rate_limit_compact_fires_at_threshold(agent_server, monkeyp
 
     monkeypatch.setattr(agent_server, "compact_session", fake_compact_session)
 
-    agent_server.agent_rate_limits["TestAgent"] = {"status": "allowed", "utilization": 0.42}
+    _set_rl(agent_server, "TestAgent", {"status": "allowed", "utilization": 0.42})
     assert await agent_server.maybe_rate_limit_compact("TestAgent", already_compacted=False) is False
     assert calls == []
 
-    agent_server.agent_rate_limits["TestAgent"] = {"status": "allowed", "utilization": 0.98}
+    _set_rl(agent_server, "TestAgent", {"status": "allowed", "utilization": 0.98})
     assert await agent_server.maybe_rate_limit_compact("TestAgent", already_compacted=False) is True
     assert calls == [("TestAgent", "rate-limit utilization")]
 
@@ -149,7 +194,7 @@ async def test_maybe_rate_limit_compact_skips_if_already_compacted(agent_server,
 
     monkeypatch.setattr(agent_server, "compact_session", fake_compact_session)
 
-    agent_server.agent_rate_limits["TestAgent"] = {"status": "allowed", "utilization": 0.99}
+    _set_rl(agent_server, "TestAgent", {"status": "allowed", "utilization": 0.99})
     result = await agent_server.maybe_rate_limit_compact("TestAgent", already_compacted=True)
     assert result is False
     assert calls == []

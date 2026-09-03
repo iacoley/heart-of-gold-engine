@@ -916,9 +916,18 @@ class DiscordAdapter(discord.Client):
                 agents = data.get("agents") or {}
                 if not agents:
                     return "**/sys usage**: no agents configured."
-                lines = [f"`{name}` — {(agents[name] or {}).get('summary', 'no reading')}"
-                         for name in sorted(agents)]
-                return "**/sys usage**\n" + "\n".join(lines)
+                # 2026-09-03 (task-1788454188): format_usage_report's
+                # summary is now a multi-line dual-bar block (one bar per
+                # rate-limit window, own "[SYS] Account usage — {agent}"
+                # header already baked in) rather than a single line, so
+                # this no longer prefixes `name` — a code fence keeps the
+                # Unicode block bars aligned monospace, which Discord's
+                # default proportional text won't do.
+                blocks = [
+                    f"```\n{(agents[name] or {}).get('summary', 'no reading')}\n```"
+                    for name in sorted(agents)
+                ]
+                return "**/sys usage**\n" + "\n".join(blocks)
 
             if cmd == "restart-server":
                 # Whole-process action like status/usage, no agent target.

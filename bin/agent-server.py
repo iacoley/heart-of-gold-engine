@@ -474,7 +474,17 @@ agent_todo_lists: Dict[str, List[Dict]] = {}
 # where everything else we're both doing is inferring it"). Kept
 # in-memory for cheap access alongside the persisted copy in the
 # rate_limits DB table (see init_db / _record_rate_limit_event).
-agent_rate_limits: Dict[str, Dict[str, Any]] = {}
+#
+# 2026-09-03: restructured from Dict[agent, info] to
+# Dict[agent, Dict[rate_limit_type, info]] (task-1788454188) — a flat
+# per-agent dict meant a seven_day event and a five_hour event fought
+# over the same slot, so only whichever arrived most recently was ever
+# visible. Code that wants the single "how urgent is this right now"
+# signal (the pause/warning gates, the notices, /agents' backward-compat
+# `rate_limit` field) should call _rate_limit_primary(agent) rather than
+# reaching into this dict directly. Code that wants the full breakdown
+# (format_usage_report, /usage's `windows` field) reads this directly.
+agent_rate_limits: Dict[str, Dict[str, Dict[str, Any]]] = {}
 # Tracks whether we've already posted the #signals pause/resume notice
 # for the agent's *current* pause episode, so rate_limit_gate_sweep_loop
 # retrying every 60s doesn't spam a notice on every retry while still
@@ -641,35 +651,89 @@ async def init_db():
 
     # Rate-limit state table (2026-08-06) — Anthropic's own live signal
     # for account usage against the five_hour/weekly windows, straight off
-    # the CLI's stream-json `rate_limit_event`. One row per agent, always
-    # overwritten with the latest known state (history isn't the point
-    # here, "are we close to the edge right now" is). See
+    # the CLI's stream-json `rate_limit_event`. History isn't the point
+    # here, "are we close to the edge right now" is. See
     # _record_rate_limit_event() in read_agent_response().
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS rate_limits (
-            agent TEXT PRIMARY KEY,
-            status TEXT,
-            rate_limit_type TEXT,
-            resets_at INTEGER,
-            overage_status TEXT,
-            overage_resets_at INTEGER,
-            is_using_overage INTEGER DEFAULT 0,
-            utilization REAL,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    # 2026-08-08: utilization added after the hard-stop moved from
-    # Anthropic's status flag to a pure utilization threshold (see
-    # is_rate_limit_paused()) — without persisting the number itself, a
-    # restart mid-pause couldn't tell it had been paused and would
-    # silently resume early. CREATE TABLE IF NOT EXISTS is a no-op on the
-    # already-live table, so this migrates it explicitly; ALTER TABLE has
-    # no "IF NOT EXISTS" in sqlite, hence the try/except.
-    try:
-        await db.execute("ALTER TABLE rate_limits ADD COLUMN utilization REAL")
+    #
+    # 2026-09-03 (task-1788454188): this used to be `agent TEXT PRIMARY
+    # KEY` — one row per agent, period, regardless of which window the
+    # event was even about. A seven_day rate_limit_event would silently
+    # clobber a five_hour reading and vice versa, so the two windows could
+    # never both be known at once — the actual blocker on showing a
+    # dual-bar usage report like Amos's. Composite key on (agent,
+    # rate_limit_type) lets both windows live side by side. SQLite can't
+    # ALTER a table's PRIMARY KEY in place, so detect the old shape and
+    # rebuild rather than relying on CREATE TABLE IF NOT EXISTS, which
+    # would just no-op against the already-live old table.
+    async with db.execute("PRAGMA table_info(rate_limits)") as cursor:
+        existing_cols = await cursor.fetchall()
+
+    if not existing_cols:
+        await db.execute("""
+            CREATE TABLE rate_limits (
+                agent TEXT NOT NULL,
+                rate_limit_type TEXT NOT NULL,
+                status TEXT,
+                resets_at INTEGER,
+                overage_status TEXT,
+                overage_resets_at INTEGER,
+                is_using_overage INTEGER DEFAULT 0,
+                utilization REAL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (agent, rate_limit_type)
+            )
+        """)
         await db.commit()
-    except Exception:
-        pass  # column already exists
+    else:
+        pk_cols = {c["name"] for c in existing_cols if c["pk"]}
+        if pk_cols == {"agent"}:
+            # Old single-row-per-agent shape. First make sure `utilization`
+            # exists on it (2026-08-08 migration, same try/except-ALTER
+            # pattern as everywhere else in this file, since ALTER TABLE
+            # has no "IF NOT EXISTS" in sqlite) so the copy below always
+            # has a column to select, even on an install that predates it.
+            try:
+                await db.execute("ALTER TABLE rate_limits ADD COLUMN utilization REAL")
+                await db.commit()
+            except Exception:
+                pass  # column already exists
+            log.warning(
+                "Migrating rate_limits table from single-row-per-agent to "
+                "composite (agent, rate_limit_type) primary key (task-1788454188)"
+            )
+            await db.execute("ALTER TABLE rate_limits RENAME TO rate_limits_old_pk")
+            await db.execute("""
+                CREATE TABLE rate_limits (
+                    agent TEXT NOT NULL,
+                    rate_limit_type TEXT NOT NULL,
+                    status TEXT,
+                    resets_at INTEGER,
+                    overage_status TEXT,
+                    overage_resets_at INTEGER,
+                    is_using_overage INTEGER DEFAULT 0,
+                    utilization REAL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (agent, rate_limit_type)
+                )
+            """)
+            # A pre-migration row's rate_limit_type may be NULL (an install
+            # that never saw a typed event yet) — land those under the
+            # literal string "unknown" rather than NULL, since NULL in a
+            # composite PK column would let duplicate (agent, NULL) rows
+            # pile up instead of upserting cleanly next time.
+            await db.execute("""
+                INSERT INTO rate_limits
+                    (agent, rate_limit_type, status, resets_at, overage_status,
+                     overage_resets_at, is_using_overage, utilization, updated_at)
+                SELECT agent, COALESCE(NULLIF(rate_limit_type, ''), 'unknown'),
+                       status, resets_at, overage_status, overage_resets_at,
+                       is_using_overage, utilization, updated_at
+                FROM rate_limits_old_pk
+            """)
+            await db.execute("DROP TABLE rate_limits_old_pk")
+            await db.commit()
+        # else: already on the composite-key shape (a prior run of this
+        # same migration) — nothing to do.
 
     # Rate-limit override table (2026-08-10) — see agent_rate_limit_overrides
     # comment above and is_rate_limit_override_active(). One row per agent,
@@ -898,16 +962,19 @@ def estimate_context_tokens(metadata: Dict[str, Any]) -> int:
 
 async def _record_rate_limit_event(agent: str, info: Dict[str, Any]) -> None:
     """Persist the CLI's own live rate-limit signal (2026-08-06). One row
-    per agent, always overwritten — this is "where do we stand right
-    now," not a history. Logs a warning when we're not simply "allowed",
-    or when overage is actually being spent, so it shows up in
-    agent-server.log without needing anyone to go looking for it."""
-    agent_rate_limits[agent] = info
+    per (agent, rate_limit_type) — see the 2026-09-03 migration comment on
+    the rate_limits table in init_db() — always overwritten within that
+    window, this is "where do we stand right now," not a history. Logs a
+    warning when we're not simply "allowed", or when overage is actually
+    being spent, so it shows up in agent-server.log without needing
+    anyone to go looking for it."""
+    rate_limit_type = info.get("rateLimitType") or "unknown"
+    agent_rate_limits.setdefault(agent, {})[rate_limit_type] = info
     status = info.get("status")
     is_using_overage = bool(info.get("isUsingOverage"))
     if status != "allowed" or is_using_overage:
         log.warning(
-            f"{agent} rate limit: status={status} type={info.get('rateLimitType')} "
+            f"{agent} rate limit: status={status} type={rate_limit_type} "
             f"resetsAt={info.get('resetsAt')} overage={info.get('overageStatus')} "
             f"isUsingOverage={is_using_overage}"
         )
@@ -917,12 +984,11 @@ async def _record_rate_limit_event(agent: str, info: Dict[str, Any]) -> None:
         await db.execute(
             """
             INSERT INTO rate_limits
-                (agent, status, rate_limit_type, resets_at, overage_status,
+                (agent, rate_limit_type, status, resets_at, overage_status,
                  overage_resets_at, is_using_overage, utilization, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(agent) DO UPDATE SET
+            ON CONFLICT(agent, rate_limit_type) DO UPDATE SET
                 status=excluded.status,
-                rate_limit_type=excluded.rate_limit_type,
                 resets_at=excluded.resets_at,
                 overage_status=excluded.overage_status,
                 overage_resets_at=excluded.overage_resets_at,
@@ -932,8 +998,8 @@ async def _record_rate_limit_event(agent: str, info: Dict[str, Any]) -> None:
             """,
             (
                 agent,
+                rate_limit_type,
                 status,
-                info.get("rateLimitType"),
                 info.get("resetsAt"),
                 info.get("overageStatus"),
                 info.get("overageResetsAt"),
@@ -944,6 +1010,25 @@ async def _record_rate_limit_event(agent: str, info: Dict[str, Any]) -> None:
         await db.commit()
     except Exception as e:
         log.warning(f"Failed to persist rate_limit_event for {agent}: {e}")
+
+def _rate_limit_primary(agent: str) -> Optional[Dict[str, Any]]:
+    """Pick which window's reading governs the single-value gates
+    (is_rate_limit_paused, is_rate_limit_warning, maybe_rate_limit_compact,
+    the pause/warning #signals notices, and the backward-compat flat
+    fields on /agents and /usage) now that agent_rate_limits can hold more
+    than one window per agent at once (task-1788454188). A `rejected`
+    status wins outright regardless of window — that's Anthropic already
+    denying a request, stronger than any utilization number. Otherwise
+    the window with the highest utilization governs, since that's the one
+    actually closest to tripping the pause threshold. Returns None only
+    when nothing has been recorded for this agent at all."""
+    windows = agent_rate_limits.get(agent)
+    if not windows:
+        return None
+    for info in windows.values():
+        if info.get("status") == RATE_LIMIT_REJECTED_STATUS:
+            return info
+    return max(windows.values(), key=lambda i: i.get("utilization") or 0)
 
 async def _load_rate_limits_from_db() -> None:
     """Preload the last-known rate-limit status per agent at startup, so
@@ -961,39 +1046,50 @@ async def _load_rate_limits_from_db() -> None:
     try:
         now = time.time()
         async with db.execute(
-            "SELECT agent, status, rate_limit_type, resets_at, utilization FROM rate_limits"
+            "SELECT agent, rate_limit_type, status, resets_at, utilization FROM rate_limits"
         ) as cursor:
             rows = await cursor.fetchall()
         for row in rows:
             resets_at = row["resets_at"]
             if resets_at and resets_at <= now:
                 continue  # stale — window already over, let a live event set this
-            utilization = row["utilization"]
-            agent_rate_limits[row["agent"]] = {
+            rate_limit_type = row["rate_limit_type"] or "unknown"
+            agent_rate_limits.setdefault(row["agent"], {})[rate_limit_type] = {
                 "status": row["status"],
                 "rateLimitType": row["rate_limit_type"],
                 "resetsAt": resets_at,
-                "utilization": utilization,
+                "utilization": row["utilization"],
             }
-            # Hard-pause criteria is status=="rejected" OR utilization
-            # crossing the threshold (see is_rate_limit_paused()) —
-            # restoring both (not just status) is what lets a restart
-            # mid-pause stay paused instead of silently resuming until
-            # the next live event.
-            if row["status"] == RATE_LIMIT_REJECTED_STATUS:
+        # Hard-pause criteria is status=="rejected" OR utilization crossing
+        # the threshold (see is_rate_limit_paused()) — restoring both (not
+        # just status) is what lets a restart mid-pause stay paused instead
+        # of silently resuming until the next live event. Logged once per
+        # agent off the same _rate_limit_primary() selection the actual
+        # gates use, rather than per-row, now that an agent can have more
+        # than one live window restored at once.
+        for agent in agent_rate_limits:
+            info = _rate_limit_primary(agent)
+            if not info:
+                continue
+            utilization = info.get("utilization")
+            rate_limit_type = info.get("rateLimitType")
+            if info.get("status") == RATE_LIMIT_REJECTED_STATUS:
                 log.warning(
-                    f"{row['agent']} restored rate-limit pause state from DB "
-                    "on startup (status=rejected) — staying paused until it clears"
+                    f"{agent} restored rate-limit pause state from DB "
+                    f"on startup (status=rejected, type={rate_limit_type}) — "
+                    "staying paused until it clears"
                 )
             elif utilization and utilization >= RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD:
                 log.warning(
-                    f"{row['agent']} restored rate-limit pause state from DB "
-                    f"on startup ({utilization:.0%} utilization) — staying paused until it clears"
+                    f"{agent} restored rate-limit pause state from DB "
+                    f"on startup ({utilization:.0%} utilization, type={rate_limit_type}) — "
+                    "staying paused until it clears"
                 )
-            elif row["status"] == RATE_LIMIT_PAUSE_STATUS:
+            elif info.get("status") == RATE_LIMIT_PAUSE_STATUS:
                 log.warning(
-                    f"{row['agent']} restored rate-limit warning state from DB "
-                    "on startup — not paused, still under the hard-stop threshold"
+                    f"{agent} restored rate-limit warning state from DB "
+                    f"on startup (type={rate_limit_type}) — not paused, "
+                    "still under the hard-stop threshold"
                 )
     except Exception as e:
         log.warning(f"Failed to preload rate_limits from DB (non-fatal): {e}")
@@ -1117,6 +1213,24 @@ def rate_limit_window_progress(info: Optional[Dict[str, Any]], now: Optional[flo
     return (window - remaining) / window
 
 
+_USAGE_BAR_WIDTH = 20
+_RATE_LIMIT_TYPE_LABELS = {
+    "five_hour": "5-hour",
+    "seven_day": "7-day (all models)",
+}
+
+def _usage_bar(fraction: Optional[float]) -> str:
+    """Render a Unicode-block progress bar, e.g. '████████░░░░░░░░░░░░'.
+    None renders as a run of '?' rather than an empty (0%-looking) bar —
+    same "unknown must never read as zero" rule as
+    rate_limit_window_progress(), for the same reason: a reassuring blank
+    bar standing in for no data is worse than visibly not knowing."""
+    if fraction is None:
+        return "?" * _USAGE_BAR_WIDTH
+    fraction = max(0.0, min(1.0, fraction))
+    filled = round(fraction * _USAGE_BAR_WIDTH)
+    return "█" * filled + "░" * (_USAGE_BAR_WIDTH - filled)
+
 def format_usage_report(agent: str, now: Optional[float] = None) -> str:
     """Render an agent's current rate-limit headroom for a human — the
     counterpart to cost-report.sh: that answers "what has this spent",
@@ -1124,51 +1238,68 @@ def format_usage_report(agent: str, now: Optional[float] = None) -> str:
     that actually stops a turn mid-sentence. Never raises on a
     partial/missing reading.
 
-    2026-08-29: utilization moved to the front, and the wall-clock
-    window-progress percentage (how much of the 5h window has elapsed —
-    unrelated to actual usage) dropped from this line in favor of plain
-    remaining time. Real incident: at 04:04 UTC the window was ~65%
-    through its wall-clock life while utilization — the number that
-    actually trips the 97% pause threshold — was already at 98-99%. Two
-    numbers that both read as "the percentage" in one line, and the one
-    that gates the pause wasn't the one anyone's eye landed on first.
-    Ian's fix (2026-08-29): utilization up front, window-progress percent
-    replaced with H:MM remaining. `rate_limit_window_progress()` itself
-    is unchanged and still backs the 80%-of-window warning backstop in
+    2026-09-03 (task-1788454188): rewritten from a single-line summary to
+    a bracketed [SYS]-style block with one progress bar per known
+    rate-limit window (five_hour, seven_day), matching the format Ian
+    pointed at from Amos's instance (IMG_6549.png). This was blocked
+    until agent_rate_limits could hold more than one window per agent at
+    once — see the rate_limits table migration in init_db() and
+    _rate_limit_primary() — since previously a seven_day reading and a
+    five_hour reading fought over the same slot and only one could ever
+    be shown.
+
+    Each bar's fill is utilization, never rate_limit_window_progress()
+    (wall-clock time elapsed in the window) — those are different numbers
+    that both look like "the percentage" at a glance, and conflating them
+    was a real incident (2026-08-29: window ~65% through its wall-clock
+    life while utilization, the number that actually trips the pause
+    threshold, was already 98-99%). rate_limit_window_progress() is
+    unchanged and still backs the 80%-of-window warning backstop in
     is_rate_limit_warning() and the raw `percent_of_window_used` field on
-    /usage — only this human-facing line stops surfacing it as a
-    percentage."""
-    info = agent_rate_limits.get(agent)
-    if not info:
+    /usage — it just doesn't drive what these bars fill to."""
+    windows = agent_rate_limits.get(agent)
+    if not windows:
         return (
             "No rate-limit reading yet — the CLI reports headroom in-band, "
             "so this fills in the first time the agent takes a turn."
         )
 
-    parts = [f"status `{info.get('status') or 'unknown'}`"]
+    now = time.time() if now is None else now
+    lines = [f"[SYS] Account usage — {agent}"]
 
-    utilization = info.get("utilization")
-    if utilization is not None:
-        parts.append(f"{utilization * 100:.0f}% utilization")
+    # Fixed display order (five_hour, then seven_day) rather than dict/
+    # insertion order, so the report reads the same every time regardless
+    # of which event happened to arrive first — anything else Anthropic
+    # ever adds just gets tacked on the end instead of dropped.
+    ordered_types = [t for t in ("five_hour", "seven_day") if t in windows]
+    ordered_types += [t for t in windows if t not in ordered_types]
 
-    resets_at = info.get("resetsAt")
-    if resets_at:
-        now = time.time() if now is None else now
-        remaining = int(resets_at - now)
-        if remaining > 0:
-            hours, minutes = divmod(remaining // 60, 60)
-            parts.append(f"window resets in {hours}h{minutes:02d}m")
+    any_overage = False
+    for rate_limit_type in ordered_types:
+        info = windows[rate_limit_type]
+        utilization = info.get("utilization")
+        pct = f"{utilization * 100:.0f}%" if utilization is not None else "? %"
+        label = _RATE_LIMIT_TYPE_LABELS.get(rate_limit_type, rate_limit_type)
+
+        resets_at = info.get("resetsAt")
+        if resets_at:
+            reset_str = f"resets {format_reset_time(resets_at)}"
         else:
-            parts.append("window has reset")
-    else:
-        parts.append("window remaining unknown")
+            reset_str = "reset time unknown"
 
-    if info.get("isUsingOverage"):
-        parts.append("currently on overage")
-    elif info.get("overageStatus"):
-        parts.append(f"overage {info.get('overageStatus')}")
+        status = info.get("status")
+        flag = ""
+        if status == RATE_LIMIT_REJECTED_STATUS:
+            flag = " [REJECTED]"
+        elif status == RATE_LIMIT_PAUSE_STATUS:
+            flag = " [WARNING]"
 
-    return ", ".join(parts)
+        lines.append(f"{_usage_bar(utilization)} {pct}  {label} — {reset_str}{flag}")
+        if info.get("isUsingOverage"):
+            any_overage = True
+
+    lines.append(f"Extra usage: {'active (spending past plan limits)' if any_overage else 'none'}")
+    return "\n".join(lines)
 
 
 def is_rate_limit_warning(agent: str) -> bool:
@@ -1182,8 +1313,13 @@ def is_rate_limit_warning(agent: str) -> bool:
     utilization is never present at all, confirmed live on Amos's
     instance). Logged and notified (see _notify_rate_limit_warning) but
     never holds the queue — see is_rate_limit_paused() for the actual
-    hard stop."""
-    info = agent_rate_limits.get(agent, {})
+    hard stop.
+
+    2026-09-03: reads _rate_limit_primary(agent) rather than indexing
+    agent_rate_limits directly, now that an agent can have more than one
+    window tracked at once (task-1788454188) — see that function's
+    docstring for the selection rule."""
+    info = _rate_limit_primary(agent) or {}
     if info.get("status") in (RATE_LIMIT_PAUSE_STATUS, RATE_LIMIT_REJECTED_STATUS):
         return True
     if (info.get("utilization") or 0) >= RATE_LIMIT_WARNING_UTILIZATION_THRESHOLD:
@@ -1210,10 +1346,15 @@ def is_rate_limit_paused(agent: str) -> bool:
     NOT change what Anthropic will actually accept; a genuinely rejected
     request still gets rejected at the API layer either way. All this
     bypasses is our own app-level queue hold, for the rare case Ian wants
-    a fix pushed through immediately instead of waiting for the window."""
+    a fix pushed through immediately instead of waiting for the window.
+
+    2026-09-03: reads _rate_limit_primary(agent) rather than indexing
+    agent_rate_limits directly, now that an agent can have more than one
+    window tracked at once (task-1788454188) — see that function's
+    docstring for the selection rule."""
     if is_rate_limit_override_active(agent):
         return False
-    info = agent_rate_limits.get(agent, {})
+    info = _rate_limit_primary(agent) or {}
     if info.get("status") == RATE_LIMIT_REJECTED_STATUS:
         return True
     return (info.get("utilization") or 0) >= RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD
@@ -1245,12 +1386,15 @@ async def _notify_rate_limit_pause(agent: str, paused: bool) -> None:
         if not signals_channel:
             return
         if paused:
-            resets = agent_rate_limits.get(agent, {}).get("resetsAt")
+            # 2026-09-03: primary window (task-1788454188) — see
+            # _rate_limit_primary()'s docstring for the selection rule,
+            # now that more than one window can be tracked at once.
+            info = _rate_limit_primary(agent) or {}
+            resets = info.get("resetsAt")
             resets_str = (
                 format_reset_time(resets)
                 if isinstance(resets, (int, float)) else "an unknown time"
             )
-            info = agent_rate_limits.get(agent, {})
             if info.get("status") == RATE_LIMIT_REJECTED_STATUS:
                 reason = "a request was already rejected by Anthropic"
             else:
@@ -1278,7 +1422,10 @@ async def _notify_rate_limit_warning(agent: str, warning: bool) -> None:
         if not signals_channel:
             return
         if warning:
-            info = agent_rate_limits.get(agent, {})
+            # 2026-09-03: primary window (task-1788454188) — see
+            # _rate_limit_primary()'s docstring for the selection rule,
+            # now that more than one window can be tracked at once.
+            info = _rate_limit_primary(agent) or {}
             utilization = info.get("utilization") or 0
             status = info.get("status")
             if utilization:
@@ -1404,7 +1551,10 @@ async def maybe_rate_limit_compact(agent: str, already_compacted: bool) -> bool:
     a second finalize+restart back to back."""
     if already_compacted:
         return False
-    utilization = agent_rate_limits.get(agent, {}).get("utilization") or 0
+    # 2026-09-03: primary window (task-1788454188) — see
+    # _rate_limit_primary()'s docstring for the selection rule, now that
+    # more than one window can be tracked at once.
+    utilization = (_rate_limit_primary(agent) or {}).get("utilization") or 0
     if utilization < RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD:
         return False
 
@@ -2860,7 +3010,9 @@ async def check_queued_acks():
             # actual cause when we have one; fall back to the old generic
             # copy only when it's just normal turn-processing.
             if is_rate_limit_paused(agent):
-                resets_at = agent_rate_limits.get(agent, {}).get("resetsAt")
+                # 2026-09-03: primary window (task-1788454188) — see
+                # _rate_limit_primary()'s docstring for the selection rule.
+                resets_at = (_rate_limit_primary(agent) or {}).get("resetsAt")
                 if resets_at:
                     reset_str = format_reset_time(resets_at)
                     reason = f"paused — five-hour rate limit window in the warning zone, resumes ~{reset_str}"
@@ -3817,7 +3969,15 @@ async def handle_agents(request):
             # empty until this agent's subprocess has completed at least
             # one turn since agent-server last started (see
             # _record_rate_limit_event / read_agent_response).
-            "rate_limit": agent_rate_limits.get(agent, {}),
+            #
+            # 2026-09-03 (task-1788454188): this field is now the single
+            # "most urgent" window (see _rate_limit_primary()'s selection
+            # rule) for backward compatibility with existing consumers
+            # (relay.py's /sys status line expects this exact flat shape).
+            # rate_limit_windows below carries the full per-window
+            # breakdown for anything that wants both bars.
+            "rate_limit": _rate_limit_primary(agent) or {},
+            "rate_limit_windows": agent_rate_limits.get(agent, {}),
             # Context-window fill estimate, added 2026-08-07 — same caveat
             # as rate_limit: empty until this agent's subprocess has
             # completed at least one turn since agent-server last started.
@@ -4095,6 +4255,14 @@ async def handle_usage(request):
     is_rate_limit_warning()/is_rate_limit_paused() already use — see
     format_usage_report() — rather than a separate table, since every
     field this needs is already tracked there.
+
+    2026-09-03 (task-1788454188): the flat status/rate_limit_type/
+    resets_at/utilization fields below now describe only
+    _rate_limit_primary()'s pick (kept for backward compatibility with
+    existing callers of this endpoint) — `windows` is the new field that
+    actually carries every known window at once, which is what let
+    format_usage_report's `summary` grow a bar per window instead of
+    clobbering down to one.
     """
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
@@ -4102,7 +4270,8 @@ async def handle_usage(request):
 
     agents = {}
     for name in agent_config:
-        info = agent_rate_limits.get(name)
+        windows = agent_rate_limits.get(name) or {}
+        info = _rate_limit_primary(name)
         progress = rate_limit_window_progress(info) if info else None
         agents[name] = {
             "status": info.get("status") if info else None,
@@ -4114,6 +4283,7 @@ async def handle_usage(request):
             # None, never 0 — "no reading yet" and "0% consumed" are
             # opposite answers and must not render as the same number.
             "percent_of_window_used": round(progress * 100, 1) if progress is not None else None,
+            "windows": windows,
             "summary": format_usage_report(name),
         }
 

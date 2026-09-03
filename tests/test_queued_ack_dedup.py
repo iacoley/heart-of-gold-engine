@@ -72,7 +72,10 @@ async def test_same_stuck_message_only_acked_once(agent_server, monkeypatch):
     posts = []
     monkeypatch.setattr(agent_server, "post_to_discord", _fake_post(posts))
     monkeypatch.setattr(agent_server, "is_rate_limit_paused", lambda agent: True)
-    agent_server.agent_rate_limits["TestAgent"] = {"resetsAt": None}
+    # Nested Dict[agent, Dict[rate_limit_type, info]] shape (task-1788454188)
+    # — see _rate_limit_primary() in agent-server.py, which the ack-reason
+    # path in check_queued_acks() reads through.
+    agent_server.agent_rate_limits["TestAgent"] = {"unknown": {"resetsAt": None}}
 
     await _queue_message(agent_server, "TestAgent", "chan-1", "msg-1", age_sec=100)
 

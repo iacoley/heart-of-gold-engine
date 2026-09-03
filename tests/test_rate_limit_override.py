@@ -79,7 +79,9 @@ def test_override_is_per_agent(agent_server):
 # -- is_rate_limit_paused with an override active ----------------------------
 
 def test_override_bypasses_rejected_status(agent_server):
-    agent_server.agent_rate_limits["TestAgent"] = {"status": "rejected"}
+    # Nested Dict[agent, Dict[rate_limit_type, info]] shape (task-1788454188)
+    # — see _rate_limit_primary() in agent-server.py.
+    agent_server.agent_rate_limits["TestAgent"] = {"unknown": {"status": "rejected"}}
     assert agent_server.is_rate_limit_paused("TestAgent") is True  # sanity: paused without override
     agent_server.agent_rate_limit_overrides["TestAgent"] = {
         "enabled_by": "Ian", "reason": "urgent fix", "expires_at": agent_server.time.time() + 60,
@@ -88,7 +90,7 @@ def test_override_bypasses_rejected_status(agent_server):
 
 
 def test_override_bypasses_high_utilization(agent_server):
-    agent_server.agent_rate_limits["TestAgent"] = {"status": "allowed", "utilization": 0.99}
+    agent_server.agent_rate_limits["TestAgent"] = {"unknown": {"status": "allowed", "utilization": 0.99}}
     assert agent_server.is_rate_limit_paused("TestAgent") is True  # sanity
     agent_server.agent_rate_limit_overrides["TestAgent"] = {
         "enabled_by": "Ian", "reason": "", "expires_at": agent_server.time.time() + 60,
@@ -97,7 +99,7 @@ def test_override_bypasses_high_utilization(agent_server):
 
 
 def test_expired_override_no_longer_bypasses(agent_server):
-    agent_server.agent_rate_limits["TestAgent"] = {"status": "rejected"}
+    agent_server.agent_rate_limits["TestAgent"] = {"unknown": {"status": "rejected"}}
     agent_server.agent_rate_limit_overrides["TestAgent"] = {
         "enabled_by": "Ian", "reason": "", "expires_at": agent_server.time.time() - 1,
     }
@@ -105,8 +107,8 @@ def test_expired_override_no_longer_bypasses(agent_server):
 
 
 def test_override_on_one_agent_does_not_affect_another(agent_server):
-    agent_server.agent_rate_limits["AgentA"] = {"status": "rejected"}
-    agent_server.agent_rate_limits["AgentB"] = {"status": "rejected"}
+    agent_server.agent_rate_limits["AgentA"] = {"unknown": {"status": "rejected"}}
+    agent_server.agent_rate_limits["AgentB"] = {"unknown": {"status": "rejected"}}
     agent_server.agent_rate_limit_overrides["AgentA"] = {
         "enabled_by": "Ian", "reason": "", "expires_at": agent_server.time.time() + 60,
     }
