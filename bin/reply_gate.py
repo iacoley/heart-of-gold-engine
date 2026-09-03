@@ -343,6 +343,10 @@ def _selftest() -> int:
     t["now"] += 301
     check("cooldown expires", g.evaluate(M(content="later today")).needs_score, True)
 
+    g_fresh = ReplyGate(self_id="me", names=("marvin",), cooldown_sec=300, clock=lambda: 10.0)
+    check("fresh gate with low uptime does not trigger false cooldown",
+          g_fresh.evaluate(M(content="hello world")).needs_score, True)
+
     # -- 2026-08-09: scorer-failure fallback must not collapse to 0.0 --
     d5 = g.evaluate(M(content="scorer will fail on this one"))
     r5 = g.resolve(d5, None, fallback=True)

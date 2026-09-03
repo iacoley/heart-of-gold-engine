@@ -77,17 +77,21 @@ def test_reply_to_self_with_peer_mention_wakes_marvin():
 
 
 def test_peer_mention_with_marvin_named_in_prose_falls_through_to_scorer():
-    gate = ReplyGate(self_id="marvin_bot_id", names=("marvin",), cooldown_sec=300)
-    msg = GateMessage(
-        channel_id="c_agent_chat",
-        author_id="user_ryan",
-        content="@Zero check X. Marvin, what do you think?",
-        mentions_self=False,
-        mentions_other=True,
-    )
-    decision = gate.evaluate(msg)
-    assert decision.needs_score, "Must fall through to scorer when Marvin is named in prose"
-    assert decision.named is True
+    # Verify both default clock and low-uptime system clock (fresh CI runner where uptime < cooldown_sec)
+    for clock_fn in (None, lambda: 10.0):
+        kwargs = {"clock": clock_fn} if clock_fn else {}
+        gate = ReplyGate(self_id="marvin_bot_id", names=("marvin",), cooldown_sec=300, **kwargs)
+        msg = GateMessage(
+            channel_id="c_agent_chat",
+            author_id="user_ryan",
+            content="@Zero check X. Marvin, what do you think?",
+            mentions_self=False,
+            mentions_other=True,
+        )
+        decision = gate.evaluate(msg)
+        assert decision.needs_score, f"Must fall through to scorer when Marvin is named in prose (clock={clock_fn})"
+        assert decision.tier == "tier2", f"Expected tier2, got {decision.tier}"
+        assert decision.named is True
 
 
 def test_misdirected_required_handoff_declines_cleanly():
