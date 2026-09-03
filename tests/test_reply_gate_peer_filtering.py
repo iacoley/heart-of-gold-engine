@@ -132,3 +132,46 @@ if __name__ == "__main__":
     test_misdirected_required_handoff_declines_cleanly()
     test_handoff_envelope_floor_attribute()
     print("All peer filtering tests passed!")
+
+
+def test_fresh_gate_is_not_in_cooldown_on_a_small_monotonic_clock():
+    """Regression: a gate that has never woken must never report a cooldown.
+
+    time.monotonic()'s epoch is arbitrary (uptime on Linux). The old 0.0
+    sentinel only looked correct because monotonic() is large on a long-lived
+    machine. On a CI runner 63 seconds into its life, a brand-new ReplyGate
+    reported 'cooldown, 237s left' and skipped the scorer entirely.
+    """
+    gate = ReplyGate(self_id="marvin_bot_id", names=("marvin",),
+                     cooldown_sec=300, clock=lambda: 63.0)
+    msg = GateMessage(
+        channel_id="c_fresh",
+        author_id="user_ryan",
+        content="@Zero - Marvin, is your gate still dropping envelopes?",
+        mentions_self=False,
+        mentions_other=True,
+    )
+    decision = gate.evaluate(msg)
+    assert decision.tier != "cooldown", (
+        f"A gate with no recorded wake must not be in cooldown, got {decision!r}"
+    )
+    assert decision.needs_score, "Must reach the Tier 2 scorer"
+
+
+def test_cooldown_still_applies_after_a_real_wake():
+    """The sentinel fix must not disable the cooldown it guards."""
+    clock = {"t": 63.0}
+    gate = ReplyGate(self_id="marvin_bot_id", names=("marvin",),
+                     cooldown_sec=300, clock=lambda: clock["t"])
+    gate._last_tier2_wake["c_fresh"] = clock["t"]
+    msg = GateMessage(
+        channel_id="c_fresh",
+        author_id="user_ryan",
+        content="@Zero - Marvin, thoughts on the gate?",
+        mentions_self=False,
+        mentions_other=True,
+    )
+    clock["t"] += 10.0
+    decision = gate.evaluate(msg)
+    assert decision.tier == "cooldown", f"Expected cooldown, got {decision!r}"
+    assert not decision.needs_score

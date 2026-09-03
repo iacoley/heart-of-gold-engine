@@ -176,9 +176,18 @@ class ReplyGate:
                 named=named, channel_id=msg.channel_id,
             )
 
-        last = self._last_tier2_wake.get(msg.channel_id, 0.0)
-        remaining = self.cooldown_sec - (self._clock() - last)
-        if remaining > 0:
+        # `None`, not 0.0, for "never woken in this channel". The old sentinel
+        # was 0.0 measured against time.monotonic(), whose epoch is arbitrary —
+        # uptime on Linux. On a long-lived box monotonic() is large, so
+        # `cooldown - (huge - 0)` is deeply negative and the sentinel appeared
+        # to work; on a fresh CI runner monotonic() can be under a minute, and
+        # a brand-new gate that has never woken reports itself still in
+        # cooldown. Found 2026-09-03 by Marvin on this PR's CI: a gate with an
+        # empty wake map returned `cooldown, 237s left` on a runner 63 seconds
+        # into its life. Local runs passed for exactly the wrong reason.
+        last = self._last_tier2_wake.get(msg.channel_id)
+        remaining = 0.0 if last is None else self.cooldown_sec - (self._clock() - last)
+        if last is not None and remaining > 0:
             return Decision(
                 False, "cooldown", f"{int(remaining)}s left",
                 named=named, channel_id=msg.channel_id,
