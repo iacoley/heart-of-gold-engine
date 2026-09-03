@@ -36,4 +36,21 @@ PyYAML==6.0.2
 # venv before touching this file; note the library shipping `round`
 # doesn't by itself wire handoff.py/topic_tracker.py to use it — that's
 # separate follow-up work, not done by this bump.
-banana-protocol @ git+https://github.com/brockventures/banana-protocol.git@v0.2.0
+#
+# 2026-09-03: bumped v0.2.0 -> v0.5.1 (commit 0e802c5, PR #9 upstream —
+# no v0.5.1 tag exists yet so pinned to the commit directly, same as the
+# original 9298d7d pin before v0.1.1 was tagged). Fixes Amos's finding 4
+# (should_reply() no longer turns a peer's reply:none yield into a
+# summons) and finding 5 (default max_rounds 2 -> 4, was clamping
+# legitimate multi-round dialogue early); adds an `sdk` wire field for
+# channel-visible version tracking. Verified clean in an isolated /tmp
+# venv (import + HandoffEnvelope field check) before touching this file.
+# No call-site impact today: grepped bin/agent-server.py and
+# bin/speaking_banana.py, neither references should_reply() or
+# max_rounds from this package yet, so this is pure upside with no
+# behavior change on my side. Requested by Ryan/Zero in #lounge, landed
+# on "Moon Problem"/Ian's go-ahead there ("do it", 23:56 UTC). Same as
+# the last two bumps: package upgrade only picks up on the next
+# agent-server.py restart (Ian/Mike's call, not self-triggerable) since
+# it's imported once at process start via speaking_banana.py.
+banana-protocol @ git+https://github.com/brockventures/banana-protocol.git@0e802c5
