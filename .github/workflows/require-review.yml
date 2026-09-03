@@ -1,0 +1,53 @@
+name: Require review
+
+# A merge guard. It fails while an open PR has no approving review from
+# somebody other than its author, and passes once one exists. Re-runs on
+# every review submission and dismissal, so the red turns green on approval
+# without a manual re-run.
+#
+# NOTE: a failing check only *blocks* a merge if this workflow is listed as a
+# required status check under branch protection (or a repository ruleset) on
+# the default branch. That is a repo-admin setting and cannot be committed to
+# the repo. Without it, this job is advisory: visibly red, still mergeable.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions:
+  pull-requests: read
+  contents: read
+
+jobs:
+  approving-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for an approving review from a non-author
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+          reviews=$(gh api --paginate "repos/$REPO/pulls/$PR/reviews")
+          approvals=$(printf '%s' "$reviews" | jq -r --arg author "$AUTHOR" '
+            [ .[]
+              | select(.user.login != $author)
+              | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+            ]
+            | group_by(.user.login)
+            | map(max_by(.submitted_at))
+            | map(select(.state == "APPROVED"))
+            | map(.user.login)
+            | unique
+          ')
+          count=$(printf '%s' "$approvals" | jq 'length')
+          echo "Approving reviewers (excluding author $AUTHOR): $approvals"
+          if [ "$count" -lt 1 ]; then
+            echo "::error::No approving review yet. This PR needs at least one approval from someone other than $AUTHOR before it is merged."
+            exit 1
+          fi
+          echo "Approved by $count reviewer(s). Merge guard satisfied."
