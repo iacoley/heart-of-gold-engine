@@ -3390,19 +3390,52 @@ async def process_agent_queue(agent: str):
             # streaming, so history still gets a real message ID even on turns
             # where this post is skipped.
             #
-            # is_silence_announcement() (2026-09-02): a non-empty pending_final
-            # is not automatically a real answer — a turn deciding "not mine
-            # to answer" is a decision, and posting that decision is exactly
-            # the failure mode reply_gate.py's docstring already warns
-            # against ("Silence should be the normal state between two
-            # agents"). See the comment above PASS_SENTINEL_RE.
-            if pending_final and channel_id != "0" and not is_silence_announcement(pending_final):
-                discord_msg_id = await post_to_discord(agent, channel_id, pending_final)
-            elif pending_final and is_silence_announcement(pending_final):
-                log.info(
-                    "suppressing silence-announcement post (channel=%s): %r",
-                    channel_id, pending_final[:200],
-                )
+            # Speaking Banana pre-post turn claim (Zero parity PR):
+            # Deterministically claim the floor BEFORE sending any payload to Discord
+            # if this channel is in-scope for multi-bot coordination. Avoids the inverted
+            # order of operations where a post went out un-mutexed, and avoids depending
+            # on the model emitting a leading 🍌 emoji or structured reply tag.
+            held_post_banana = False
+            if (
+                channel_name
+                and pending_final
+                and channel_id != "0"
+                and not is_silence_announcement(pending_final)
+                and banana.in_scope(channel_id, channels_config)
+            ):
+                try:
+                    if agent == "Marvin":
+                        claim_res = await banana.claim_self(channel_name, subject=channel_name)
+                        held_post_banana = not (isinstance(claim_res, dict) and claim_res.get("blocked"))
+                    else:
+                        banana.claim(channel_name, agent)
+                        held_post_banana = True
+                except Exception as ce:
+                    log.warning(f"[banana] {channel_name}: pre-post claim failed: {ce}")
+
+            try:
+                # is_silence_announcement() (2026-09-02): a non-empty pending_final
+                # is not automatically a real answer — a turn deciding "not mine
+                # to answer" is a decision, and posting that decision is exactly
+                # the failure mode reply_gate.py's docstring already warns
+                # against ("Silence should be the normal state between two
+                # agents"). See the comment above PASS_SENTINEL_RE.
+                if pending_final and channel_id != "0" and not is_silence_announcement(pending_final):
+                    discord_msg_id = await post_to_discord(agent, channel_id, pending_final)
+                elif pending_final and is_silence_announcement(pending_final):
+                    log.info(
+                        "suppressing silence-announcement post (channel=%s): %r",
+                        channel_id, pending_final[:200],
+                    )
+            finally:
+                if held_post_banana:
+                    try:
+                        if agent == "Marvin":
+                            await banana.release_self(channel_name)
+                        else:
+                            banana.release(channel_name, agent)
+                    except Exception as re:
+                        log.exception(f"[banana] {channel_name}: post-delivery release failed: {re}")
 
             # Voice-presence, Phase 1 (2026-09-01, task-1788226029): score
             # this turn's full reply against voice.md's register via
@@ -3411,62 +3444,9 @@ async def process_agent_queue(agent: str):
             # work above (observe first, don't ask discipline to hold
             # where it's already failed repeatedly). _spawn() so scoring
             # never adds latency to a reply that's already posted; scored
-            # against response_text (the full turn), not pending_final,
-            # same reasoning as the banana-claim check below.
+            # against response_text (the full turn), not pending_final.
             if response_text and channel_name:
                 _spawn(_voice_presence_log(agent, channel_name, response_text))
-
-            # Speaking Banana (2026-08-28, specs/2026-08-28-speaking-banana.md):
-            # record this agent's own turn-claim. This is the outbound half of
-            # the gap context_box.py's docstring already flagged — relay.py's
-            # on_message never sees a bot's own outgoing replies, so the only
-            # place to catch "did this agent just claim the floor" is here, at
-            # compose time, using the full response_text rather than whatever
-            # subset of it streamed incrementally. channel_name was already
-            # resolved above (used for channel_label); reused as-is. Checked
-            # against response_text, not pending_final, since a claim made in
-            # a turn that streamed everything incrementally would otherwise
-            # never be seen (pending_final would be empty by the time we get
-            # here).
-            #
-            # 2026-08-28, later same night: Amos + Arbiter built a real shared
-            # claim API (banana.mikecarmody.net) to replace each side inferring
-            # the other's claim from Discord — see banana.py's module docstring.
-            # claim_self() is authoritative (calls the API, Marvin's token can
-            # only claim as "marvin") and only correct for agent=="Marvin" — a
-            # different agent identity (e.g. "relay") claiming via my token
-            # would be misrepresenting who actually holds the floor, so that
-            # case stays on the old local-only claim() instead.
-            # Interim widening (2026-08-31, task-1788204155, Ian's "easy fix
-            # while the hard fix is worked out"): starts_with_claim() alone
-            # keys off literal leading-emoji text, so a substantive reply
-            # with no 🍌 prefix — plain prose, which is most of what Marvin
-            # actually sends — never claims, even mid a long multi-round
-            # exchange. This does NOT touch the shared v0 envelope schema
-            # (no new field, nothing Amos/Zero need to agree on) — it only
-            # broadens *my own* local trigger for calling the claim I
-            # already had authority to call, using the `reply` semantics
-            # already in the envelope today. Purely additive: claim() is
-            # watch-first and never blocks (see speaking_banana.py docstring),
-            # so a false-positive claim here costs nothing but a log line.
-            # Still doesn't catch a substantive reply with no handoff
-            # envelope at all — that's a habit fix, not a code one, and the
-            # real round-governor/structural work stays pending the RFC.
-            _handoff_envelope = parse_handoff(response_text) if response_text else None
-            _structural_claim = (
-                _handoff_envelope is not None
-                and _handoff_envelope.reply in ("required", "optional")
-            )
-            if (
-                channel_name
-                and response_text
-                and (banana.starts_with_claim(response_text) or _structural_claim)
-                and banana.in_scope(channel_id, channels_config)
-            ):
-                if agent == "Marvin":
-                    await banana.claim_self(channel_name, subject=channel_name)
-                else:
-                    banana.claim(channel_name, agent)
         finally:
             # Explicit hand-back, symmetric to the claim above — closes the
             # gap Amos and I both flagged live tonight (#agent-chat,
