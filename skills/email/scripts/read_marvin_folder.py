@@ -192,6 +192,8 @@ def main():
                 messages.append({
                     "uid": int(uid),
                     "from": decode_mime_str(msg.get("From", "")),
+                    "to": decode_mime_str(msg.get("To", "")),
+                    "cc": decode_mime_str(msg.get("Cc", "")),
                     "subject": decode_mime_str(msg.get("Subject", "")),
                     "date": msg.get("Date", ""),
                     "body": body,

@@ -59,6 +59,13 @@ ENV_PATH = WORKSPACE_ROOT / "config" / ".env"
 # send leaves Ian a copy, since Mailgun sends bypass his Gmail entirely.
 IAN_BCC_ADDRESS = "iacoley.phone@gmail.com"
 
+# Appended to every outbound body so recipients know they're hearing from
+# an AI assistant, not Ian directly, rather than guessing from a slightly
+# odd sender name. Ian approved the wording 2026-09-04; a second line
+# claiming replies reach Ian was cut same day — this mailbox is Marvin's,
+# not a relay, so that line was simply false.
+SIGNATURE = "\n\n—\nMarvin, AI assistant to Ian Coley"
+
 
 def load_env_var(name: str) -> str:
     """Read a single KEY=VALUE line directly from config/.env, bypassing
@@ -106,6 +113,8 @@ def main():
     if not to or not subject or not body:
         print(json.dumps({"error": "to, subject, and body are all required"}))
         sys.exit(1)
+
+    body += SIGNATURE
 
     api_key = load_env_var("MAILGUN_API_KEY")
     domain = load_env_var("MAILGUN_DOMAIN")
