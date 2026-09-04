@@ -213,6 +213,28 @@ def test_usage_report_no_overage_says_none(agent_server):
     assert "Extra usage: none" in report
 
 
+def test_usage_report_falls_back_to_window_progress_label(agent_server):
+    """2026-09-04 (task-1788468492): utilization has never once come
+    through on this account (confirmed against agent-server.log), so the
+    "? %" case above is the permanent common case, not a rare gap — that
+    made every real /sys usage call unreadable. When resetsAt IS known
+    (so real window-progress can be computed), fall back to displaying
+    that instead of a bare "?" — but visibly labeled as a weaker,
+    different signal, never silently standing in for utilization the way
+    the 2026-08-29 incident did."""
+    now = 1000.0
+    _set_rl(agent_server, "TestAgent", {
+        "status": "allowed",
+        "rateLimitType": "five_hour",
+        "resetsAt": now + (5 * 3600 * 0.75),  # 25% of the window elapsed
+        # no utilization key at all
+    })
+    report = agent_server.format_usage_report("TestAgent", now=now)
+    assert "~25% window elapsed" in report
+    assert "no usage reading" in report
+    assert "? %" not in report
+
+
 def test_usage_report_includes_utilization_when_present(agent_server):
     _set_rl(agent_server, "TestAgent", {
         "status": "allowed", "rateLimitType": "five_hour", "utilization": 0.42,

@@ -1278,7 +1278,6 @@ def format_usage_report(agent: str, now: Optional[float] = None) -> str:
     for rate_limit_type in ordered_types:
         info = windows[rate_limit_type]
         utilization = info.get("utilization")
-        pct = f"{utilization * 100:.0f}%" if utilization is not None else "? %"
         label = _RATE_LIMIT_TYPE_LABELS.get(rate_limit_type, rate_limit_type)
 
         resets_at = info.get("resetsAt")
@@ -1294,7 +1293,28 @@ def format_usage_report(agent: str, now: Optional[float] = None) -> str:
         elif status == RATE_LIMIT_PAUSE_STATUS:
             flag = " [WARNING]"
 
-        lines.append(f"{_usage_bar(utilization)} {pct}  {label} — {reset_str}{flag}")
+        if utilization is not None:
+            bar, pct = _usage_bar(utilization), f"{utilization * 100:.0f}%"
+        else:
+            # utilization has never once come through on this account's
+            # rate_limit_event (task-1788468492) — confirmed against the DB
+            # and agent-server.log, not a one-off gap. Rather than show a
+            # bare "?" forever, fall back to window time-progress — but
+            # visibly labeled as a different, weaker signal, not silently
+            # substituted for it. Conflating the two (unlabeled) is exactly
+            # what caused the 2026-08-29 incident (bar read ~65% "used" off
+            # window progress while true utilization was already 98%); this
+            # keeps that incident's fix (utilization drives the pause logic,
+            # never window progress) and only changes what's displayed when
+            # there is no utilization reading to show at all.
+            progress = rate_limit_window_progress(info, now)
+            if progress is not None:
+                bar = _usage_bar(progress)
+                pct = f"~{progress * 100:.0f}% window elapsed (no usage reading)"
+            else:
+                bar, pct = _usage_bar(None), "? %"
+
+        lines.append(f"{bar} {pct}  {label} — {reset_str}{flag}")
         if info.get("isUsingOverage"):
             any_overage = True
 
