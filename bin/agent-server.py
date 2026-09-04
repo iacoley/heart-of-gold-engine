@@ -2183,6 +2183,25 @@ async def post_to_discord(agent: str, channel_id: str, content: str, reply_to: O
     if channel_id == "0":
         return None
 
+    # Silence discipline, enforced structurally (task-1788365086): a turn
+    # that decides not to speak must emit zero bytes, not a visible blank
+    # message. Four prior fixes lived only in persona/voice.md and all four
+    # relapsed, because the actual gap was never in the model's judgment —
+    # it was that nothing downstream of that judgment ever verified the
+    # result before calling the Discord API. split_discord_message() already
+    # drops a true empty string (`[text] if text else []` -> `[]`), so a
+    # literal "" never reaches this point; what got through and posted as a
+    # visible blank message twice in #general (2026-09-04 00:03) was
+    # whitespace-only content, which is truthy and survives that check.
+    # Stripped here, at the one function every posting path funnels through,
+    # so it can't be bypassed by finding yet another caller that skips it.
+    if not content or not content.strip():
+        log.info(
+            f"post_to_discord: suppressing whitespace/empty content for "
+            f"{agent} in {channel_id} (silence discipline, task-1788365086)"
+        )
+        return None
+
     # Get agent's Discord token, fallback to primary agent
     token = AGENT_TOKENS.get(agent)
     if not token:
