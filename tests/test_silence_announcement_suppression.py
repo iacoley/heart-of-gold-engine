@@ -105,3 +105,21 @@ def test_empty_and_whitespace_only_are_not_flagged_as_announcements():
 def test_call_site_uses_the_suppression():
     src = AGENT_SERVER.read_text()
     assert "not is_silence_announcement(pending_final)" in src
+
+
+def test_interim_flush_uses_the_suppression():
+    """The pending_final gate above only covers the true final answer.
+    flush_pending_text() posts interim/italic asides straight to Discord on
+    a separate path — confirmed live 2026-09-02 in #agent-chat (interim
+    segments like "Not mine to take..." posted despite matching every
+    SILENCE_ANNOUNCEMENT_RE shape) since nothing there ever called
+    is_silence_announcement(). Guild-based quiet mode (2026-08-28) hides
+    this in crab-cavern channels by turning streaming off entirely, but the
+    same interim segment can precede a real final answer in a home-guild
+    channel where streaming stays on, so the content-level gate has to live
+    here too, independent of guild."""
+    src = AGENT_SERVER.read_text()
+    start = src.index("async def flush_pending_text")
+    end = src.index("\n    try:", start)
+    body = src[start:end]
+    assert "is_silence_announcement(pending_interim_text)" in body

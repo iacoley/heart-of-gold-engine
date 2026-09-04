@@ -2680,9 +2680,28 @@ async def read_agent_response(
     async def flush_pending_text():
         nonlocal pending_interim_text, text_streamed_this_turn, last_discord_msg_id
         if pending_interim_text and stream_to_channel and channel_id != "0":
-            msg_id = await post_to_discord(agent, channel_id, f"*{pending_interim_text}*")
-            if msg_id:
-                last_discord_msg_id = msg_id
+            # is_silence_announcement() (2026-09-02) was only ever wired in at
+            # the pending_final post site below — this interim path posted
+            # straight to Discord with no content gate at all. Confirmed live
+            # (agent-server.log, 2026-09-02 17:09/21:26, #agent-chat): an
+            # interstitial "Not mine to take" / "no message sent" segment gets
+            # flushed as italic interim text *before* the model goes on to say
+            # more, so it never reaches pending_final and never hit the guard.
+            # Guild-based quiet mode (2026-08-28) already stops this class of
+            # noise for crab-cavern channels (stream_to_channel is forced off
+            # there), but this check is content-based and guild-agnostic on
+            # purpose: the same interim segment can just as easily precede a
+            # real final answer in a home-guild channel (#general etc.), where
+            # streaming is intentionally still on.
+            if is_silence_announcement(pending_interim_text):
+                log.info(
+                    "suppressing silence-announcement interim post (channel=%s): %r",
+                    channel_id, pending_interim_text[:200],
+                )
+            else:
+                msg_id = await post_to_discord(agent, channel_id, f"*{pending_interim_text}*")
+                if msg_id:
+                    last_discord_msg_id = msg_id
             text_streamed_this_turn = True
         pending_interim_text = None
 
