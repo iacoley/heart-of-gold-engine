@@ -2,15 +2,11 @@
 Tests for bin/memory-maintenance.py — Memory consolidation and decay.
 """
 
-import json
-import os
-import sqlite3
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import pytest
 
-from conftest import import_script, PACKAGE_ROOT
+from conftest import import_script
 
 
 class TestMemoryDatabaseInit:
@@ -57,12 +53,22 @@ class TestMemoryDatabaseInit:
 
 
 class TestMemoryDecay:
-    """Test episode importance decay."""
+    """Test episode importance decay.
 
-    def test_decay_reduces_importance(self, memory_db, tmp_workspace, monkeypatch):
-        conn, db_path = memory_db
+    Rewritten 2026-09-05 (debloat pass, task from Ian): both tests here used
+    to insert a row and then re-derive the decay/cutoff arithmetic inline in
+    the test itself, without ever calling the real decay_importance()/
+    prune_low_importance() in bin/memory-maintenance.py. That meant the two
+    actual functions had zero test coverage anywhere in the suite (confirmed
+    via grep) despite tests existing with their names in the docstrings.
+    Rewritten to call the real functions against a real mm.init_db()
+    connection, same pattern TestMemoryDatabaseInit already uses correctly.
+    """
+
+    def test_decay_reduces_importance_by_the_documented_formula(self, tmp_workspace, monkeypatch):
         monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_workspace))
-        monkeypatch.setenv("MEMORY_DECAY_RATE", "0.25")
+        mm = import_script("memory-maintenance")
+        conn = mm.init_db()
 
         old_date = (datetime.now(timezone.utc) - timedelta(days=4)).isoformat()
         conn.execute(
@@ -71,15 +77,24 @@ class TestMemoryDecay:
         )
         conn.commit()
 
-        cursor = conn.execute("SELECT importance FROM episodes WHERE summary = 'Test episode'")
-        row = cursor.fetchone()
-        assert row is not None
-        assert row[0] == 8.0
+        decayed_count = mm.decay_importance(conn)
+
+        row = conn.execute(
+            "SELECT importance FROM episodes WHERE summary = 'Test episode'"
+        ).fetchone()
+        assert decayed_count == 1
+        # docstring formula: effective = importance - (days_old / 4 * DECAY_RATE)
+        # 4 days old, default DECAY_RATE=0.25 -> lose exactly 0.25
+        assert row["importance"] == pytest.approx(7.75)
         conn.close()
 
-    def test_episodes_below_cutoff_eligible_for_pruning(self, memory_db):
-        """Episodes with effective score below cutoff should be prunable."""
-        conn, _ = memory_db
+    def test_decay_does_not_touch_episodes_at_or_below_cutoff(self, tmp_workspace, monkeypatch):
+        """decay_importance's own query is `WHERE importance > cutoff` --
+        an episode already at/below the cutoff is left for prune_low_importance
+        instead, not decayed further."""
+        monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_workspace))
+        mm = import_script("memory-maintenance")
+        conn = mm.init_db()
 
         old_date = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
         conn.execute(
@@ -88,60 +103,36 @@ class TestMemoryDecay:
         )
         conn.commit()
 
-        cursor = conn.execute("SELECT importance FROM episodes WHERE summary = 'Old boring episode'")
-        row = cursor.fetchone()
-        decay_rate = 0.25
-        effective = row[0] - (30 * decay_rate)
-        assert effective < 6.0
+        decayed_count = mm.decay_importance(conn)
+
+        row = conn.execute(
+            "SELECT importance FROM episodes WHERE summary = 'Old boring episode'"
+        ).fetchone()
+        assert decayed_count == 0
+        assert row["importance"] == 2.0
         conn.close()
 
-
-class TestEpisodeStorage:
-    """Test episode CRUD operations."""
-
-    def test_insert_episode(self, memory_db):
-        conn, _ = memory_db
+    def test_prune_low_importance_removes_only_episodes_below_cutoff(self, tmp_workspace, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_workspace))
+        mm = import_script("memory-maintenance")
+        conn = mm.init_db()
 
         now = datetime.now(timezone.utc).isoformat()
         conn.execute(
-            "INSERT INTO episodes (summary, importance, channel, tags, agents, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            ("User discussed deployment", 7.5, "general", "deploy,ops", "amos", now),
+            "INSERT INTO episodes (summary, importance, created_at) VALUES (?, ?, ?)",
+            ("Old boring episode", 2.0, now),
         )
-        conn.commit()
-
-        cursor = conn.execute("SELECT * FROM episodes WHERE summary LIKE '%deployment%'")
-        row = cursor.fetchone()
-        assert row is not None
-        assert row[2] == 7.5
-        conn.close()
-
-    def test_facts_table(self, memory_db):
-        conn, _ = memory_db
-
         conn.execute(
-            "INSERT INTO facts (subject, content, confidence, domain) VALUES (?, ?, ?, ?)",
-            ("OwnerName", "Lives in a region", 0.95, "personal"),
+            "INSERT INTO episodes (summary, importance, created_at) VALUES (?, ?, ?)",
+            ("Still relevant episode", 8.0, now),
         )
         conn.commit()
 
-        cursor = conn.execute("SELECT * FROM facts WHERE subject = 'OwnerName'")
-        row = cursor.fetchone()
-        assert row is not None
-        assert "region" in row[2]
-        conn.close()
+        pruned_count = mm.prune_low_importance(conn)
 
-    def test_patterns_table(self, memory_db):
-        conn, _ = memory_db
-
-        conn.execute(
-            "INSERT INTO patterns (agent, pattern_type, content, confidence) VALUES (?, ?, ?, ?)",
-            ("test-agent", "correction", "Don't fabricate URLs", 0.9),
-        )
-        conn.commit()
-
-        cursor = conn.execute("SELECT * FROM patterns WHERE agent = 'test-agent'")
-        row = cursor.fetchone()
-        assert row is not None
-        assert "fabricate" in row[3]
+        remaining = [
+            row["summary"] for row in conn.execute("SELECT summary FROM episodes").fetchall()
+        ]
+        assert pruned_count == 1
+        assert remaining == ["Still relevant episode"]
         conn.close()

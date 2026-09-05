@@ -127,17 +127,6 @@ def test_handoff_envelope_floor_attribute():
     assert getattr(env_plain, "floor", None) is None
 
 
-if __name__ == "__main__":
-    test_peer_mention_drops_immediately_without_scoring()
-    test_dual_mention_wakes_marvin()
-    test_role_mention_with_peer_mention_wakes_marvin()
-    test_reply_to_self_with_peer_mention_wakes_marvin()
-    test_peer_mention_with_marvin_named_in_prose_falls_through_to_scorer()
-    test_misdirected_required_handoff_declines_cleanly()
-    test_handoff_envelope_floor_attribute()
-    print("All peer filtering tests passed!")
-
-
 def test_fresh_gate_is_not_in_cooldown_on_a_small_monotonic_clock():
     """Regression: a gate that has never woken must never report a cooldown.
 
