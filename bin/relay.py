@@ -1566,6 +1566,23 @@ class DiscordAdapter(discord.Client):
                 target_agent = discord_id_to_agent[mention.id]
                 break
 
+        # Shared-role mention (e.g. @robots): route to *this* bot specifically,
+        # even in channels with no blanket default_agent. A role ping is an
+        # explicit address to "any listening bot" -- a stronger signal than
+        # plain unaddressed chatter -- and answering it shouldn't require
+        # making the whole channel always-on (that was the 2026-09-05 mistake:
+        # flipping #lounge's default_agent to fix this fixed it by making
+        # every message route, not just role-mention ones). This only changes
+        # outcomes for channels that were previously silently dropping the
+        # role-mention case; already-always-on channels (default_agent set)
+        # resolve the same target via the fallback below regardless.
+        if not target_agent:
+            robots_role_id = channels_config.get("robots_role_id")
+            if robots_role_id and any(
+                str(r.id) == str(robots_role_id) for r in message.role_mentions
+            ):
+                target_agent = discord_id_to_agent.get(self.user.id)
+
         # Fall back to channel default agent
         if not target_agent:
             channel_config = channels_config.get("channels", {}).get(channel_name, {})
