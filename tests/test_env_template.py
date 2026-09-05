@@ -12,6 +12,8 @@ its own content checks stayed, unlike the wizard-specific ones.
 
 from pathlib import Path
 
+import pytest
+
 PACKAGE_ROOT = Path(__file__).parent.parent
 
 
@@ -21,20 +23,21 @@ class TestEnvTemplate:
     def setup_method(self):
         self.content = (PACKAGE_ROOT / "config" / ".env.template").read_text()
 
-    def test_has_required_vars(self):
-        required = [
-            "AGENT_SERVER_TOKEN",
-            "OWNER_DISCORD_ID",
-        ]
-        for var in required:
-            assert var in self.content, f"Missing required env var: {var}"
-
-    def test_has_cost_limits(self):
-        assert "COST_DAILY_LIMIT" in self.content
-        assert "COST_MONTHLY_LIMIT" in self.content
-
-    def test_has_session_secret(self):
-        assert "SESSION_SECRET" in self.content
+    # Merged 2026-09-05 (debloat pass): test_has_required_vars,
+    # test_has_cost_limits, and test_has_session_secret used to be three
+    # separate functions each asserting `"X" in self.content` for a
+    # different variable name -- same check, no distinct behavior between
+    # them. Parametrizing preserves every individual assertion (and gives
+    # a clearer per-var failure report) with no coverage lost.
+    @pytest.mark.parametrize("var", [
+        "AGENT_SERVER_TOKEN",
+        "OWNER_DISCORD_ID",
+        "COST_DAILY_LIMIT",
+        "COST_MONTHLY_LIMIT",
+        "SESSION_SECRET",
+    ])
+    def test_has_required_var(self, var):
+        assert var in self.content, f"Missing required env var: {var}"
 
     def test_no_filled_secrets(self):
         """Template should have placeholder values, not real secrets."""

@@ -5,7 +5,6 @@ Shared pytest fixtures for Karakos test suite.
 import importlib.util
 import json
 import os
-import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -134,43 +133,9 @@ def protected_paths_config(tmp_workspace):
     config_path.write_text(json.dumps(config))
     return config
 
-
-@pytest.fixture
-def memory_db(tmp_workspace):
-    """Create an initialized memory database."""
-    db_path = tmp_workspace / "data" / "memory" / "memory.db"
-    conn = sqlite3.connect(str(db_path))
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS episodes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            summary TEXT NOT NULL,
-            importance REAL DEFAULT 5.0,
-            channel TEXT,
-            tags TEXT,
-            agents TEXT,
-            created_at TIMESTAMP,
-            consolidated_at TIMESTAMP DEFAULT NULL,
-            embedding BLOB
-        );
-        CREATE TABLE IF NOT EXISTS facts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            subject TEXT NOT NULL,
-            content TEXT NOT NULL,
-            confidence REAL DEFAULT 0.8,
-            domain TEXT DEFAULT 'general',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS patterns (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            agent TEXT NOT NULL,
-            pattern_type TEXT NOT NULL,
-            content TEXT NOT NULL,
-            confidence REAL DEFAULT 0.7,
-            reinforcement_count INTEGER DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP
-        );
-    """)
-    conn.commit()
-    return conn, db_path
+# memory_db fixture removed 2026-09-05 (debloat pass): it hand-rolled a
+# second copy of the episodes/facts/patterns schema instead of using the
+# real bin/memory-maintenance.py init_db(), so nothing built on it ever
+# exercised real app code. Its only caller (test_memory.py) was rewritten
+# to use import_script("memory-maintenance") + mm.init_db() directly,
+# matching the pattern TestMemoryDatabaseInit already used correctly.
