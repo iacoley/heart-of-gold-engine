@@ -5,6 +5,20 @@ name: Require review
 # every review submission and dismissal, so the red turns green on approval
 # without a manual re-run.
 #
+# EXEMPT_AUTHORS (2026-09-05, Ian): commits/PRs from Marvin carry Ian's own
+# GitHub identity (iacoley) -- same pattern as Amos under mcarmody -- which
+# made this check structurally unsatisfiable for Marvin's own PRs (GitHub
+# blocks self-approval, and the check filters reviews by
+# `user.login != author` anyway, so "iacoley approves iacoley" was never
+# going to pass). Every merge so far has gone through the admin-override
+# bypass instead. Ian's call: stop requiring the unsatisfiable case and
+# skip the check outright for iacoley; still enforced for every other
+# author (mcarmody, brockventures, or anyone added later) exactly as
+# before. Deliberately an allowlist of who's EXEMPT, not who the check
+# APPLIES to -- a new collaborator added later defaults to "review
+# required" instead of silently skipping until someone remembers to list
+# them.
+#
 # NOTE: a failing check only *blocks* a merge if this workflow is listed as a
 # required status check under branch protection (or a repository ruleset) on
 # the default branch. That is a repo-admin setting and cannot be committed to
@@ -30,8 +44,16 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           AUTHOR: ${{ github.event.pull_request.user.login }}
+          # Space-separated logins that skip this check entirely.
+          EXEMPT_AUTHORS: "iacoley"
         run: |
           set -euo pipefail
+          for exempt in $EXEMPT_AUTHORS; do
+            if [ "$AUTHOR" = "$exempt" ]; then
+              echo "Author $AUTHOR is exempt from the review requirement. Merge guard skipped."
+              exit 0
+            fi
+          done
           reviews=$(gh api --paginate "repos/$REPO/pulls/$PR/reviews")
           approvals=$(printf '%s' "$reviews" | jq -r --arg author "$AUTHOR" '
             [ .[]
