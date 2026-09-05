@@ -347,7 +347,7 @@ THINKING_BLOCK_RE = re.compile(r"<thinking>(.*?)</thinking>", re.DOTALL)
 #      instead.
 PASS_SENTINEL_RE = re.compile(r"(^PASS\b|\bPASS[.!?]*$)")
 SILENCE_ANNOUNCEMENT_RE = re.compile(
-    r"^\*?\(.*\)\*?$"                                              # (a) whole message is a parenthetical aside
+    r"^\*?[(\[].*[)\]]\*?$"                                        # (a) whole message is a parenthetical or bracketed aside
     r"|^(Not (my mention|mine to take|addressed to me)"           # (b) unambiguous leading phrases
     r"|Sitting this one out)"
     r"|^(That mention resolves to|Same reason as)"                # (c) opener ...

@@ -62,6 +62,8 @@ REAL_SILENCE_EXAMPLES = [
     "Not addressed to me — `to: Amos` in the handoff — and still holding on Ian's instruction regardless. No action here.",
     "Same reason as a minute ago — Ian's asked me to hold off in agent-chat while he needs the tokens elsewhere, that includes role-mention wakes. Not a technical gap on the tag itself, just standing down as instructed.",
     "Sitting this one out — on something else for Ian right now, agent-chat's paused on my end till that's done.",
+    "*[no reply — floor's closed]*",
+    "[no reply — floor's closed]",
 ]
 
 

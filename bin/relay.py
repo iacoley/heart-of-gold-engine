@@ -1446,21 +1446,29 @@ class DiscordAdapter(discord.Client):
 
             if envelope and envelope.reply == "none":
                 # Sender's declared intent still wins — silence stays free,
-                # no scorer call either way — but a '?' in the prose next to
-                # reply:none is a plausible mis-declaration. Free to catch,
-                # so it's caught. Amos's addition, 2026-08-05.
-                if "?" in (message.content or ""):
-                    log.warning(
-                        f"[gate] {channel_name} handoff: reply=none but "
-                        f"content has '?' - possible sender mis-declare, "
-                        f"staying quiet anyway"
+                # no scorer call either way — but only when the floor is closed
+                # (or defaulted to closed). If floor is explicitly open, the emitting
+                # speaker yields their turn while leaving the topic open for peers
+                # to evaluate via the normal scored gate (specs/agent-handoff-envelope-v1.md).
+                # Closes task-1788566837.
+                if (envelope.floor or "").lower() == "open":
+                    log.info(
+                        f"[gate] {channel_name} handoff: reply=none floor=open -> "
+                        f"speaker yielded, falling through to scored gate"
                     )
                 else:
-                    log.info(
-                        f"[gate] {channel_name} handoff: reply=none -> "
-                        f"quiet (scorer skipped)"
-                    )
-                return
+                    if "?" in (message.content or ""):
+                        log.warning(
+                            f"[gate] {channel_name} handoff: reply=none floor={envelope.floor!r} but "
+                            f"content has '?' - possible sender mis-declare, "
+                            f"staying quiet anyway"
+                        )
+                    else:
+                        log.info(
+                            f"[gate] {channel_name} handoff: reply=none floor={envelope.floor!r} -> "
+                            f"quiet (scorer skipped)"
+                        )
+                    return
             # reply_from (handoff.py, added 2026-08-30): a `reply:required`
             # names who it's actually aimed at, in a channel with more than
             # one addressable agent. Ported from Amos's design after
