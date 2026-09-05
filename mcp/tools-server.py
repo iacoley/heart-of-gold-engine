@@ -83,18 +83,18 @@ CORE_TOOLS = [
     },
     {
         "name": "discord",
-        "description": "Discord server read-only access. Actions: history (view messages), channels (list channels), online (list members).",
+        "description": "Discord server read-only access. Actions: history (view messages), channels (list configured channels), online (list members), channel_info (live name/type lookup by ID or configured name -- the only action here that actually calls Discord's API rather than echoing local config/logs).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["history", "channels", "online"],
+                    "enum": ["history", "channels", "online", "channel_info"],
                     "description": "The action to perform"
                 },
                 "channel": {
                     "type": "string",
-                    "description": "Channel name or ID (required for history)"
+                    "description": "Channel name or ID (required for history and channel_info)"
                 },
                 "limit": {
                     "type": "integer",
@@ -421,6 +421,60 @@ def handle_core_tool(tool_name: str, args: dict) -> dict:
             return {"messages": messages[-limit:], "channel": channel}
         elif action == "online":
             return {"error": "Online member list requires Discord API access"}
+        elif action == "channel_info":
+            # The one Discord read action that's a real live API call rather
+            # than an echo of channels.json ("channels") or the local JSONL
+            # capture ("history") -- added 2026-09-05 after a rename
+            # (agent-chat -> "the-banana-stand" in Discord's UI) couldn't be
+            # confirmed any other way. A rename never changes the channel
+            # ID, so this exists to answer exactly one question: does this
+            # ID currently resolve to that name. Read-only (GET only, no
+            # token scope for anything else); matches the same
+            # already-authorized bot token every other Discord action uses,
+            # so this is closing a code gap, not requesting new permissions.
+            channel_arg = args.get("channel")
+            if not channel_arg:
+                return {"error": "channel (ID or configured name) is required for channel_info"}
+            channel_id = channel_arg
+            channels_path = WORKSPACE / "config" / "channels.json"
+            if channels_path.exists():
+                cfg = json.loads(channels_path.read_text())
+                configured = cfg.get("channels", {}).get(channel_arg)
+                if configured and configured.get("id"):
+                    channel_id = configured["id"]
+            token = os.environ.get("DISCORD_BOT_TOKEN_PRIMARY")
+            if not token:
+                return {"error": "DISCORD_BOT_TOKEN_PRIMARY not set in environment"}
+            import urllib.request
+            import urllib.error
+            req = urllib.request.Request(
+                f"https://discord.com/api/v10/channels/{channel_id}",
+                headers={
+                    "Authorization": f"Bot {token}",
+                    # Cloudflare (in front of discord.com) blocks urllib's
+                    # default User-Agent outright (error 1010) before the
+                    # request ever reaches Discord's own auth check --
+                    # found live 2026-09-05 debugging a false 403. Discord's
+                    # own docs recommend this exact format.
+                    "User-Agent": (
+                        "DiscordBot (https://github.com/iacoley/"
+                        "heart-of-gold-engine, 1.0)"
+                    ),
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read().decode())
+            except urllib.error.HTTPError as e:
+                return {"error": f"Discord API error {e.code}: {e.reason}", "queried_id": channel_id}
+            except urllib.error.URLError as e:
+                return {"error": f"request failed: {e.reason}", "queried_id": channel_id}
+            return {
+                "id": data.get("id"),
+                "name": data.get("name"),
+                "guild_id": data.get("guild_id"),
+                "type": data.get("type"),
+            }
 
     elif tool_name == "taskboard":
         # Simple file-based task tracking
