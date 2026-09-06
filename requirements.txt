@@ -62,4 +62,20 @@ PyYAML==6.0.2
 # closed), no other diff. Confirmed the tag itself resolves to that SHA
 # via the GitHub releases API, not just Zero's word for it. Same
 # restart-required caveat as above.
-banana-protocol @ git+https://github.com/brockventures/banana-protocol.git@v0.5.1
+#
+# 2026-09-06: bumped v0.5.1 -> v0.6.0 (commit 844d46f, PR #11, squash-
+# merged straight to main by Ryan minutes after Zero posted it for
+# review in #agent-chat — his repo, his call, not a heart-of-gold-engine
+# review-gate situation). Requested directly by Ryan in #lounge for
+# Zero/Marvin/Amos to all pick up. Diff is default max_rounds 4 -> 10
+# (was clamping the exact kind of 3-agent, multi-round thread we'd just
+# run in #agent-chat tonight — the changelog names Amos/Marvin/Zero
+# rooms specifically) plus sdk-string bump to "0.6.0"; fast-ack-SLA and
+# kind-classification changes are spec-doc/governance-rule text only,
+# nothing enforced in code. Verified clean in an isolated /tmp venv
+# (import + HandoffEnvelope default check: max_rounds=10, sdk="0.6.0")
+# before touching this file. No call-site impact today: grepped for
+# max_rounds/should_reply across bin/ and tests/, still nothing
+# references either — same "pure upside, no behavior change" as the
+# v0.2.0 bump. Same restart-required caveat as every bump above.
+banana-protocol @ git+https://github.com/brockventures/banana-protocol.git@v0.6.0
