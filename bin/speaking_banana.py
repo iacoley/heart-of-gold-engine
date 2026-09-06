@@ -142,14 +142,34 @@ def in_scope(channel_id: str, channels_config: dict) -> bool:
     """True if this channel shares its floor with other bots. Mirrors the
     quiet-mode guild check (agent-server.py's read_agent_response): Heart
     of Gold has one bot per channel, nothing to claim; any other guild a
-    configured channel lives in (Crab Cavern today) can collide."""
-    channel_cfg = next(
-        (cfg for cfg in channels_config.get("channels", {}).values()
-         if cfg.get("id") == channel_id),
-        None,
-    )
+    configured channel lives in (Crab Cavern today) can collide.
+
+    Channels dedicated to un-mutexed social chat (#lounge / 1534452820995080192)
+    are exempt to prevent seizing the global floor lock and starving coordination
+    channels (#the-banana-stand).
+    """
+    channel_key = None
+    channel_cfg = None
+    for k, v in channels_config.get("channels", {}).items():
+        if isinstance(v, dict) and str(v.get("id")) == str(channel_id):
+            channel_key = k
+            channel_cfg = v
+            break
+        elif isinstance(v, str) and str(v) == str(channel_id):
+            channel_key = k
+            channel_cfg = {"id": v}
+            break
+
     if channel_cfg is None:
         return False
+
+    # #lounge is open social chat; never claim the Banana mutex here
+    if channel_key == "lounge" or str(channel_id) == "1534452820995080192":
+        return False
+
+    if "banana_mutex" in channel_cfg:
+        return bool(channel_cfg["banana_mutex"])
+
     primary_guild_ids = channels_config.get("server_ids", [])
     primary_guild_id = primary_guild_ids[0] if primary_guild_ids else None
     return channel_cfg.get("guild_id") != primary_guild_id

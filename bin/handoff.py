@@ -253,7 +253,7 @@ VALID_CONTEXT_STATE = {"active", "blocked", "waiting-human", "resolved"}
 # stable list, and parsing channels.json here would just trade a
 # hand-sync problem for a load-order dependency this module doesn't
 # otherwise have.
-VALID_MIRROR_CHANNELS = {"general", "signals", "staff-comms", "agent-chat", "lounge"}
+VALID_MIRROR_CHANNELS = {"general", "signals", "staff-comms", "agent-chat", "the-banana-stand", "lounge"}
 VALID_FLOOR = {"open", "closed"}
 
 
@@ -687,7 +687,7 @@ def _selftest() -> int:
           required_but_misdirected(None, "marvin"), False)
 
     # -- 2026-08-30 additive field: mirror_to --
-    for ch in ("general", "signals", "staff-comms", "agent-chat", "lounge"):
+    for ch in ("general", "signals", "staff-comms", "agent-chat", "the-banana-stand", "lounge"):
         check(f"mirror_to={ch} accepted",
               parse_handoff(
                   f'```handoff\n{{"v":0,"kind":"status","reply":"none","mirror_to":"{ch}"}}\n```'
