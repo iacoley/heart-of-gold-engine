@@ -3461,9 +3461,28 @@ async def process_agent_queue(agent: str):
                 and not is_silence_announcement(pending_final)
                 and banana.in_scope(channel_id, channels_config)
             ):
+                # Claim subject (2026-09-07, closes a gap Zero found live in
+                # #agent-chat: "marvin-banana-protocol-brain-surgery"):
+                # previously hardcoded to channel_name (the local config key,
+                # e.g. "agent-chat"), which made every claim's subject the
+                # same literal string regardless of what topic was actually
+                # being discussed. Pull the real subject from this turn's own
+                # outbound envelope when present — same parse_handoff(response_text)
+                # pattern the context_box outbound hook below already uses, and
+                # for the same reason (response_text, not pending_final, since
+                # streaming may have already sent the envelope-bearing chunk).
+                # Falls back to channel_name, unchanged, when no envelope or no
+                # subject field — never a regression from today's behavior.
+                claim_subject = channel_name
+                try:
+                    outbound_envelope = parse_handoff(response_text) if response_text else None
+                    if outbound_envelope and outbound_envelope.subject:
+                        claim_subject = outbound_envelope.subject
+                except Exception:
+                    pass  # malformed envelope: fail open to channel_name, same as elsewhere
                 try:
                     if agent == "Marvin":
-                        claim_res = await banana.claim_self(channel_name, subject=channel_name)
+                        claim_res = await banana.claim_self(channel_name, subject=claim_subject)
                         held_post_banana = not (isinstance(claim_res, dict) and claim_res.get("blocked"))
                     else:
                         banana.claim(channel_name, agent)
@@ -3479,7 +3498,20 @@ async def process_agent_queue(agent: str):
                 # against ("Silence should be the normal state between two
                 # agents"). See the comment above PASS_SENTINEL_RE.
                 if pending_final and channel_id != "0" and not is_silence_announcement(pending_final):
-                    discord_msg_id = await post_to_discord(agent, channel_id, pending_final)
+                    # Visible claim marker (2026-09-07, same Zero finding):
+                    # held_post_banana means this turn holds the API-side
+                    # claim, but the wire text never showed it — other bots'
+                    # own starts_with_claim() peer-recognition (relay.py:1339
+                    # equivalent on their side) has nothing to see. Prepend
+                    # deterministically rather than depend on the model
+                    # remembering, same rationale as the claim call itself;
+                    # skip if the model already typed one (lstrip check
+                    # mirrors banana.starts_with_claim's own leading-whitespace
+                    # tolerance) so this never double-stamps.
+                    to_post = pending_final
+                    if held_post_banana and not to_post.lstrip().startswith(banana.CLAIM_EMOJI):
+                        to_post = f"{banana.CLAIM_EMOJI} {to_post}"
+                    discord_msg_id = await post_to_discord(agent, channel_id, to_post)
                 elif pending_final and is_silence_announcement(pending_final):
                     log.info(
                         "suppressing silence-announcement post (channel=%s): %r",

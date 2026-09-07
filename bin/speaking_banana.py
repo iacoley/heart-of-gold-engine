@@ -144,9 +144,11 @@ def in_scope(channel_id: str, channels_config: dict) -> bool:
     of Gold has one bot per channel, nothing to claim; any other guild a
     configured channel lives in (Crab Cavern today) can collide.
 
-    Channels dedicated to un-mutexed social chat (#lounge / 1534452820995080192)
-    are exempt to prevent seizing the global floor lock and starving coordination
-    channels (#the-banana-stand).
+    Channels dedicated to un-mutexed social chat (#lounge) are exempt to
+    prevent seizing the global floor lock and starving coordination
+    channels (#the-banana-stand). Matched by config key only (see below) —
+    an instance's real #lounge channel ID belongs in config/channels.json,
+    not hardcoded in engine code.
     """
     channel_key = None
     channel_cfg = None
@@ -163,8 +165,14 @@ def in_scope(channel_id: str, channels_config: dict) -> bool:
     if channel_cfg is None:
         return False
 
-    # #lounge is open social chat; never claim the Banana mutex here
-    if channel_key == "lounge" or str(channel_id) == "1534452820995080192":
+    # #lounge is open social chat; never claim the Banana mutex here.
+    # Config-key match only (2026-09-07: removed a hardcoded real channel ID
+    # that leaked instance data into portable engine code and broke the
+    # repo-split PII check — see test_no_real_discord_ids_in_engine_files).
+    # The lookup loop above already resolved channel_key from whatever this
+    # install's own channels.json says, so this was always redundant on top
+    # of being non-portable.
+    if channel_key == "lounge":
         return False
 
     if "banana_mutex" in channel_cfg:

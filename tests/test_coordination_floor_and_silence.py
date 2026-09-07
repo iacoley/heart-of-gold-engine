@@ -32,8 +32,8 @@ def test_speaking_banana_in_scope_exempts_lounge():
         "server_ids": ["home-guild-111"],
         "channels": {
             "general": {"id": "100", "guild_id": "home-guild-111"},
-            "agent-chat": {"id": "1534436119888793750", "guild_id": "crab-cavern-222"},
-            "lounge": {"id": "1534452820995080192", "guild_id": "crab-cavern-222"},
+            "agent-chat": {"id": "200", "guild_id": "crab-cavern-222"},
+            "lounge": {"id": "250", "guild_id": "crab-cavern-222"},
             "custom-unmutexed": {"id": "300", "guild_id": "crab-cavern-222", "banana_mutex": False},
             "custom-mutexed": {"id": "400", "guild_id": "crab-cavern-222", "banana_mutex": True},
         }
@@ -43,10 +43,10 @@ def test_speaking_banana_in_scope_exempts_lounge():
     assert not speaking_banana.in_scope("100", channels_cfg)
 
     # Multi-agent coordination channel is in scope
-    assert speaking_banana.in_scope("1534436119888793750", channels_cfg)
+    assert speaking_banana.in_scope("200", channels_cfg)
 
     # #lounge is strictly exempt to prevent seizing global floor lock
-    assert not speaking_banana.in_scope("1534452820995080192", channels_cfg)
+    assert not speaking_banana.in_scope("250", channels_cfg)
 
     # Explicit banana_mutex overrides
     assert not speaking_banana.in_scope("300", channels_cfg)
