@@ -1391,10 +1391,24 @@ def is_rate_limit_paused(agent: str) -> bool:
     2026-09-03: reads _rate_limit_primary(agent) rather than indexing
     agent_rate_limits directly, now that an agent can have more than one
     window tracked at once (task-1788454188) — see that function's
-    docstring for the selection rule."""
+    docstring for the selection rule.
+
+    2026-09-08 (task-1788468492): an elapsed resetsAt now clears the
+    pause outright, status/utilization notwithstanding. Previously only
+    _load_rate_limits_from_db() (the restart-time preload) treated a
+    past resetsAt as stale data to be skipped — this live gate had no
+    equivalent check, so an agent that hit status=='rejected' and then
+    went idle (no further turns to deliver a fresh rate_limit_event that
+    would overwrite it) stayed hard-paused past its own window's actual
+    reset, until it happened to take a turn anyway. Real incident
+    2026-09-03: relay sat paused on an already-expired five_hour
+    rejection because it hadn't taken a turn since 19:14:16 UTC."""
     if is_rate_limit_override_active(agent):
         return False
     info = _rate_limit_primary(agent) or {}
+    resets_at = info.get("resetsAt")
+    if isinstance(resets_at, (int, float)) and resets_at <= time.time():
+        return False
     if info.get("status") == RATE_LIMIT_REJECTED_STATUS:
         return True
     return (info.get("utilization") or 0) >= RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD

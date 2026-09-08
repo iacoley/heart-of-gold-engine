@@ -22,6 +22,8 @@ through _rate_limit_primary(), which with only one window present just
 returns that window, preserving the exact behavior these tests pin.
 """
 
+import time
+
 import pytest
 
 from conftest import import_script
@@ -133,6 +135,50 @@ def test_rejected_status_pauses_regardless_of_low_utilization(agent_server):
     still pause."""
     _set_rl(agent_server, "TestAgent", {"status": "rejected", "utilization": 0.1})
     assert agent_server.is_rate_limit_paused("TestAgent") is True
+
+
+class TestExpiredResetsAtClearsThePause:
+    """task-1788468492: is_rate_limit_paused() checked status/utilization
+    with no regard for whether the window's own resetsAt had already
+    passed — an idle agent (no fresh turn to deliver a new
+    rate_limit_event) stayed hard-paused on a rejection or high
+    utilization number well past the window it actually described.
+    Real incident 2026-09-03: relay stayed paused on an already-expired
+    five_hour rejection because it hadn't taken a turn since 19:14:16 UTC."""
+
+    def test_expired_rejection_no_longer_pauses(self, agent_server):
+        _set_rl(agent_server, "TestAgent", {
+            "status": "rejected", "rateLimitType": "five_hour",
+            "resetsAt": time.time() - 60,
+        })
+        assert agent_server.is_rate_limit_paused("TestAgent") is False
+
+    def test_expired_high_utilization_no_longer_pauses(self, agent_server):
+        _set_rl(agent_server, "TestAgent", {
+            "status": "allowed", "utilization": 0.99,
+            "resetsAt": time.time() - 1,
+        })
+        assert agent_server.is_rate_limit_paused("TestAgent") is False
+
+    def test_unexpired_rejection_still_pauses(self, agent_server):
+        _set_rl(agent_server, "TestAgent", {
+            "status": "rejected", "rateLimitType": "five_hour",
+            "resetsAt": time.time() + 300,
+        })
+        assert agent_server.is_rate_limit_paused("TestAgent") is True
+
+    def test_missing_resets_at_falls_back_to_status_check(self, agent_server):
+        """Most real payloads (per test_rejected_status_hard_pauses_
+        even_without_utilization above) never carry resetsAt at all —
+        absence must not be treated as 'expired'."""
+        _set_rl(agent_server, "TestAgent", {"status": "rejected"})
+        assert agent_server.is_rate_limit_paused("TestAgent") is True
+
+    def test_resets_at_exactly_now_counts_as_expired(self, agent_server):
+        _set_rl(agent_server, "TestAgent", {
+            "status": "rejected", "resetsAt": time.time(),
+        })
+        assert agent_server.is_rate_limit_paused("TestAgent") is False
 
 
 def test_rejected_status_wins_over_a_higher_utilization_window():
