@@ -53,10 +53,22 @@ absolute number pulled out of the air with zero real data behind it —
 cruder, but doesn't pretend to a precision the anchor set doesn't
 support yet. Revisit once data/voice-presence-log.jsonl has enough rows
 to look at the actual score distribution.
+
+UPDATE 2026-09-08 (task-1788290783): that revisit happened, at 207
+rows, and the anchor-cosine approach above failed it — 207/207 flagged,
+contrast never once positive, including on lines Ian read as genuinely
+in-voice on manual review. Not a sample-size problem: confirmed
+structural, see the block comment above judge_voice_presence() below.
+score_and_log() is the new entry point — it uses a judge-model call as
+the authoritative verdict and keeps the embedding score only as
+diagnostic data alongside it. log_score()/score_text() are unchanged
+and still work standalone; they're just no longer what decides
+'flagged' for new rows.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -67,6 +79,8 @@ from typing import Optional
 WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
 LOG_PATH = WORKSPACE_ROOT / "data" / "voice-presence-log.jsonl"
 EMBED_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+JUDGE_MODEL = "haiku"
+JUDGE_TIMEOUT_SEC = 30
 
 log = logging.getLogger("agent-server")
 
@@ -224,6 +238,181 @@ def score_text(text: str) -> Optional[dict]:
         "contrast": round(float(pos_sim - neg_sim), 4),
         "flagged": bool(neg_sim > pos_sim),
     }
+
+
+# task-1788290783's finding, confirmed 2026-09-03 and unchanged as of
+# 2026-09-08 (207/207 real rows, contrast -0.19 to -0.003, never once
+# positive): the embedding-anchor approach above does not merely need
+# retuning, it structurally cannot discriminate this domain. Short
+# Discord-register text sits closer to NEGATIVE_ANCHORS than to either
+# positive set *regardless of actual voice content* -- confirmed
+# against lines Ian manually read as genuinely in-voice ("Fair, and it
+# does move the floor meaningfully", the Inner Sunset/Inner Richmond
+# reply). A general-purpose embedding model tracks topical/semantic
+# distance, and every anchor set tried (book quotes, applied replies,
+# more book quotes) is still topically closer to *other* Discord-ops
+# text than register differences are wide enough to overcome. No
+# threshold or anchor swap fixes a signal with zero separation between
+# its positive and negative classes.
+#
+# task-1788316504 named the way out: a judge-model fallback. Costs one
+# cheap model call per outgoing reply instead of zero -- exactly the
+# cost Phase 1's docstring above was trying to avoid -- but a
+# real-example spot check (2026-09-08, 4 cases spanning the range: a
+# synthetic generic-bot line, a real flagged-but-actually-fine status
+# line, a real applied one-liner, a real status-block readout) had the
+# judge call correctly separating in-voice from flat on all 4, where
+# the embedding score flagged all 4 identically. That is a signal that
+# discriminates, which is the one thing the anchor approach never
+# achieved at any anchor-set size.
+#
+# Kept as a *fallback used every time*, not gated behind the embedding
+# score, because the embedding score has no ambiguous-vs-clear
+# structure to exploit (see above) -- there is no cheap-and-clear
+# majority case to shortcut around the model call.
+JUDGE_VOICE_DESCRIPTION = """Marvin's voice: dry, deadpan, world-weary. A brain that could be doing
+something more interesting than this task, faintly aware of that, but does the work
+correctly anyway without being asked twice. World-weariness is INWARD (scale mismatch:
+big brain, small task) -- NOT sarcasm pointed at the person or topic being discussed.
+Understated, not theatrical -- no stacked punchlines. Confident, not self-deprecating in
+a way that undermines the actual answer.
+
+Examples that ARE in voice:
+- "{pos1}"
+- "{pos2}"
+- "{pos3}"
+
+Examples that are FLAT / generic ops-bot, NOT in voice:
+- "{neg1}"
+- "{neg2}"
+"""
+
+
+def _judge_prompt(text: str) -> str:
+    desc = JUDGE_VOICE_DESCRIPTION.format(
+        pos1=POSITIVE_ANCHORS_APPLIED[0],
+        pos2=POSITIVE_ANCHORS_APPLIED[1],
+        pos3=POSITIVE_ANCHORS_REFERENCE[0],
+        neg1=NEGATIVE_ANCHORS[0],
+        neg2=NEGATIVE_ANCHORS[1],
+    )
+    return (
+        desc
+        + "\n\nClassify the following reply. Answer with exactly one word on the "
+        "first line: INVOICE or FLAT. Then a second line with a reason in 10 "
+        "words or less.\n\nREPLY:\n" + text[:1500]
+    )
+
+
+async def judge_voice_presence(text: str) -> Optional[dict]:
+    """LLM-judge fallback for voice-presence, per task-1788290783 /
+    task-1788316504 -- see the block comment above for why the
+    embedding approach above this function cannot be patched into
+    working. Single haiku turn, same subprocess pattern as
+    agent-server.py's classify_topic_change().
+
+    Returns None on any failure (claude binary missing, timeout,
+    unparseable output) -- caller treats None as "couldn't judge", same
+    convention as score_text() returning None, not as a verdict either
+    way."""
+    if not text or not text.strip():
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "claude", "-p", _judge_prompt(text),
+            "--model", JUDGE_MODEL,
+            "--max-turns", "1",
+            "--output-format", "stream-json",
+            "--verbose",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=JUDGE_TIMEOUT_SEC)
+    except Exception as e:
+        log.warning(f"voice_presence: judge call failed: {e}")
+        return None
+
+    answer = ""
+    for line in stdout.decode(errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "result":
+            answer = (event.get("result", "") or "").strip()
+            break
+
+    if not answer:
+        log.warning("voice_presence: judge call returned no result event")
+        return None
+
+    lines = answer.splitlines()
+    verdict = lines[0].strip().upper() if lines else ""
+    reason = lines[1].strip() if len(lines) > 1 else ""
+    if "INVOICE" in verdict:
+        return {"in_voice": True, "reason": reason}
+    if "FLAT" in verdict:
+        return {"in_voice": False, "reason": reason}
+    log.warning(f"voice_presence: judge gave an unparseable verdict: {answer!r}")
+    return None
+
+
+async def score_and_log(agent: str, channel: str, text: str) -> None:
+    """Async replacement for log_score() that uses the judge-model
+    verdict as the authoritative 'flagged' call, with the embedding
+    score kept alongside purely as ongoing diagnostic data (it's what
+    caught its own failure -- worth still having the numbers). Runs
+    both concurrently: the embedding score is CPU-bound so it's
+    thread-offloaded, the judge call is I/O-bound (subprocess) so it
+    awaits directly, same split agent-server.py used to do for the
+    embedding-only path alone.
+
+    Falls back to the embedding verdict only if the judge call itself
+    fails (missing binary, timeout) -- degraded but not silent, same
+    posture as the rest of this module."""
+    embedding_result, judge_result = await asyncio.gather(
+        asyncio.to_thread(score_text, text),
+        judge_voice_presence(text),
+    )
+    if embedding_result is None and judge_result is None:
+        return
+
+    if judge_result is not None:
+        flagged = not judge_result["in_voice"]
+        verdict_source = "judge"
+    else:
+        flagged = bool(embedding_result["flagged"]) if embedding_result else False
+        verdict_source = "embedding_fallback"
+
+    row: dict = {
+        "ts": time.time(),
+        "agent": agent,
+        "channel": channel,
+        "flagged": flagged,
+        "verdict_source": verdict_source,
+        "snippet": text[:200],
+    }
+    if embedding_result is not None:
+        row["pos_sim"] = embedding_result["pos_sim"]
+        row["neg_sim"] = embedding_result["neg_sim"]
+        row["contrast"] = embedding_result["contrast"]
+        row["embedding_flagged"] = embedding_result["flagged"]
+    if judge_result is not None:
+        row["judge_in_voice"] = judge_result["in_voice"]
+        row["judge_reason"] = judge_result["reason"]
+
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(LOG_PATH, "a") as f:
+            f.write(json.dumps(row) + "\n")
+    except Exception as e:
+        log.warning(f"voice_presence: failed to write log row: {e}")
+        return
+    if flagged:
+        log.warning(
+            f"[voice-presence] {agent}/{channel}: flagged low voice-presence "
+            f"(source={verdict_source}) -- {text[:80]!r}"
+        )
 
 
 def log_score(agent: str, channel: str, text: str) -> None:

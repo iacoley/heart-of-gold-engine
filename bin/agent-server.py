@@ -456,12 +456,13 @@ def _spawn(coro, name: Optional[str] = None) -> asyncio.Task:
     return task
 
 async def _voice_presence_log(agent: str, channel: str, text: str) -> None:
-    """Thread-offload wrapper around voice_presence.log_score() — embedding
-    inference (and the one-time model load) is synchronous/CPU-bound, and
-    this runs via _spawn() as a background task sharing the same event
-    loop as every other agent's turn processing, so it goes through
-    asyncio.to_thread() rather than blocking that loop directly."""
-    await asyncio.to_thread(voice_presence.log_score, agent, channel, text)
+    """Wrapper around voice_presence.score_and_log() — as of 2026-09-08
+    (task-1788290783) the authoritative verdict comes from a judge-model
+    subprocess call (I/O-bound, awaited directly) run alongside the
+    embedding score (CPU-bound, thread-offloaded internally); both are
+    handled inside score_and_log() itself. Still runs via _spawn() as a
+    background task so neither adds latency to a reply already posted."""
+    await voice_presence.score_and_log(agent, channel, text)
 
 response_buffers: Dict[str, str] = {}
 agent_last_cost: Dict[str, float] = {}

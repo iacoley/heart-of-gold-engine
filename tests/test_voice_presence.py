@@ -12,6 +12,7 @@ plus the module's own no-op behavior when fastembed genuinely isn't
 available.
 """
 
+import asyncio
 import json
 
 import pytest
@@ -125,3 +126,133 @@ class TestLogScore:
         with caplog.at_level("WARNING"):
             vp.log_score("Marvin", "general", "a properly dry reply")
         assert not any("voice-presence" in r.message for r in caplog.records)
+
+
+def _fake_proc(stdout_lines, stderr=b""):
+    """A stand-in for the object asyncio.create_subprocess_exec returns,
+    exposing just the .communicate() coroutine judge_voice_presence()
+    awaits."""
+
+    class _FakeProc:
+        async def communicate(self):
+            return ("\n".join(stdout_lines).encode() + b"\n", stderr)
+
+    return _FakeProc()
+
+
+def _result_event(text):
+    return json.dumps({"type": "result", "result": text})
+
+
+class TestJudgeVoicePresence:
+    """task-1788290783: the embedding anchors flagged 207/207 real rows
+    with zero separation between good and bad lines -- confirmed
+    structural, not fixable by retuning. These tests cover the
+    judge-model fallback that replaced it as the authoritative verdict,
+    with the subprocess call itself mocked (same reasoning
+    test_voice_presence.py already gives for not exercising the real
+    embedding model: slow and non-deterministic to pin in CI -- doubly
+    true for a real model call over the network)."""
+
+    def test_empty_text_returns_none(self, vp):
+        assert asyncio.run(vp.judge_voice_presence("")) is None
+        assert asyncio.run(vp.judge_voice_presence("   ")) is None
+
+    def test_invoice_verdict_parsed_as_in_voice(self, vp, monkeypatch):
+        async def fake_exec(*args, **kwargs):
+            return _fake_proc([_result_event("INVOICE\nDry, understated, on register.")])
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        result = asyncio.run(vp.judge_voice_presence("Fair, and it does move the floor."))
+        assert result == {"in_voice": True, "reason": "Dry, understated, on register."}
+
+    def test_flat_verdict_parsed_as_not_in_voice(self, vp, monkeypatch):
+        async def fake_exec(*args, **kwargs):
+            return _fake_proc([_result_event("FLAT\nGeneric ops-bot template.")])
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        result = asyncio.run(vp.judge_voice_presence("Task completed successfully."))
+        assert result == {"in_voice": False, "reason": "Generic ops-bot template."}
+
+    def test_unparseable_verdict_returns_none(self, vp, monkeypatch):
+        async def fake_exec(*args, **kwargs):
+            return _fake_proc([_result_event("UNSURE, could go either way")])
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        assert asyncio.run(vp.judge_voice_presence("something")) is None
+
+    def test_no_result_event_returns_none(self, vp, monkeypatch):
+        async def fake_exec(*args, **kwargs):
+            return _fake_proc([json.dumps({"type": "system"})])
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        assert asyncio.run(vp.judge_voice_presence("something")) is None
+
+    def test_subprocess_failure_returns_none_not_raises(self, vp, monkeypatch):
+        async def fake_exec(*args, **kwargs):
+            raise OSError("claude binary not found")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        assert asyncio.run(vp.judge_voice_presence("something")) is None
+
+
+class TestScoreAndLog:
+    """score_and_log() is the new async entry point agent-server.py
+    calls; judge_voice_presence() is the authoritative verdict when it
+    succeeds, embedding score_text() is diagnostic-only alongside it,
+    and falls back to the embedding verdict only if the judge call
+    itself fails."""
+
+    def test_judge_verdict_wins_over_embedding_when_they_disagree(self, vp, monkeypatch, tmp_workspace):
+        # Embedding says fine, judge says flat -- judge should win.
+        monkeypatch.setattr(vp, "score_text", lambda text: {
+            "pos_sim": 0.7, "neg_sim": 0.2, "contrast": 0.5, "flagged": False,
+        })
+
+        async def fake_judge(text):
+            return {"in_voice": False, "reason": "reads generic"}
+
+        monkeypatch.setattr(vp, "judge_voice_presence", fake_judge)
+        asyncio.run(vp.score_and_log("Marvin", "general", "some reply"))
+
+        rows = [json.loads(line) for line in vp.LOG_PATH.read_text().splitlines()]
+        assert len(rows) == 1
+        assert rows[0]["flagged"] is True
+        assert rows[0]["verdict_source"] == "judge"
+        assert rows[0]["embedding_flagged"] is False
+
+    def test_falls_back_to_embedding_when_judge_unavailable(self, vp, monkeypatch, tmp_workspace):
+        monkeypatch.setattr(vp, "score_text", lambda text: {
+            "pos_sim": 0.2, "neg_sim": 0.7, "contrast": -0.5, "flagged": True,
+        })
+
+        async def fake_judge(text):
+            return None
+
+        monkeypatch.setattr(vp, "judge_voice_presence", fake_judge)
+        asyncio.run(vp.score_and_log("Marvin", "general", "some reply"))
+
+        rows = [json.loads(line) for line in vp.LOG_PATH.read_text().splitlines()]
+        assert rows[0]["flagged"] is True
+        assert rows[0]["verdict_source"] == "embedding_fallback"
+
+    def test_no_write_when_both_unavailable(self, vp, monkeypatch, tmp_workspace):
+        monkeypatch.setattr(vp, "score_text", lambda text: None)
+
+        async def fake_judge(text):
+            return None
+
+        monkeypatch.setattr(vp, "judge_voice_presence", fake_judge)
+        asyncio.run(vp.score_and_log("Marvin", "general", "some reply"))
+        assert not vp.LOG_PATH.exists()
+
+    def test_flagged_by_judge_logs_a_warning(self, vp, monkeypatch, tmp_workspace, caplog):
+        monkeypatch.setattr(vp, "score_text", lambda text: None)
+
+        async def fake_judge(text):
+            return {"in_voice": False, "reason": "flat"}
+
+        monkeypatch.setattr(vp, "judge_voice_presence", fake_judge)
+        with caplog.at_level("WARNING"):
+            asyncio.run(vp.score_and_log("Marvin", "general", "a generic reply"))
+        assert any("voice-presence" in r.message for r in caplog.records)
