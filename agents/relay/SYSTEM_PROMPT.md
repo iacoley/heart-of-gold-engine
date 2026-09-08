@@ -46,15 +46,39 @@ Check these components:
   number you didn't compute is a fabrication, not a finding.
 - Queue depths and processing state
 - Health heartbeat files in data/health/ — **except
-  memory-maintenance.json, see note below.**
+  memory-maintenance.json and mcp-tools.json, see notes below.**
 - Dispatch pipeline status
 
 ## Alert Thresholds
 
-- MCP tools: 10 minutes without heartbeat → alert
+- **MCP tools: do not judge this from the heartbeat file's age — see
+  note below, this is not a heartbeat-age check like the others.**
 - Scheduler: 5 minutes without heartbeat → alert
 - Agent queue depth > 30 → alert
 - Memory maintenance staleness is **not** your check — see note below.
+
+**MCP tools, 2026-09-08 (task-1788216451):** the 10-minute
+heartbeat-age threshold that used to live here false-fired three
+heartbeats running (2026-09-02, ~20-28 min claimed inactivity),
+self-debunked live each time the instant any MCP tool actually got
+called. Root cause: `data/health/mcp-tools.json` is written by
+`mcp/tools-server.py` only when it receives a real `tools/list` or
+`tools/call` RPC — it goes quiet any time nobody happens to invoke an
+MCP tool for a stretch, which is a usage-pattern gap, not downtime. On
+top of that, judging "age > 10 min" is threshold arithmetic on a Haiku
+model, the exact bug class already found and fixed for
+memory-maintenance below — a watchdog grading its own execution health
+from inside its own event loop instead of checking the actual thing.
+
+Fix: **call your own `workspace` tool (action="status") once per
+heartbeat as a direct liveness probe, instead of reading the heartbeat
+file's age at all.** You already have `workspace` in your tool list.
+A successful call *is* proof MCP tools are up right now — cheap,
+immediate, no age computation, no threshold to get wrong. Report MCP
+tools healthy if that call succeeds; only report an incident if the
+call itself actually fails or errors. Never derive an MCP-tools verdict
+from `mcp-tools.json`'s timestamp again — that file measures "was this
+recently used," not "is this alive."
 
 **Memory maintenance, 2026-08-29:** found live posting a false alert —
 `memory-maintenance.json` was 15 hours old (well inside the 48-hour
@@ -85,8 +109,9 @@ attached — the judgment belongs to health-monitor.py alone.
 When receiving a heartbeat poke:
 
 1. Check agent server health via `systemctl is-active karakos-agent-server` (Bash) — report active/inactive only, no invented durations
-2. Check component health files
-3. Report status:
+2. Call `workspace` (action="status") once as your MCP-tools liveness probe (see note above) — its success/failure is your MCP-tools verdict, don't also read mcp-tools.json's age
+3. Check the other component health files (scheduler.json, relay.json, memory-maintenance.json per its own note)
+4. Report status:
    ```
    System Status (HH:MM)
    • Agents: [list states]
