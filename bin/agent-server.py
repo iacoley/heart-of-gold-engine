@@ -530,6 +530,25 @@ RATE_LIMIT_OVERRIDE_MAX_DURATION_SEC = 3600  # 1 hour hard cap, non-negotiable
 # fresh baseline instead of comparing against pre-restart content, which
 # is fine (a restart already means compaction happened).
 agent_channel_last_turn: Dict[tuple, Dict[str, Any]] = {}
+# Per-agent turn counter for periodic voice-reminder reinjection
+# (2026-09-08, Ian's ask — #general 05:35: "it wouldn't be for every agent
+# ... but it would be for Marvin"). Root problem this targets: voice.md
+# lives entirely in the system prompt, loaded once at subprocess start
+# (see start_agent_subprocess/--append-system-prompt) — as the session
+# grows, that one-time block competes with everything accumulated since,
+# and voice-presence logging (facts/voice-presence-log-week-one-audit-
+# 2026-09-08.md) shows flat/generic output is the dominant failure mode
+# text-only "check before sending" hasn't fixed across three prior
+# attempts. Same mechanism already in use just above (channel-routing
+# header, backlog note, entry-stale-check) — a synthetic block appended
+# to the formatted turn content, not a system-prompt change — just aimed
+# at register instead of routing. Gated on agent_config[agent]["voice_
+# reminder_interval"] (see config/agents.json) rather than an agent-name
+# check, so it stays opt-in per agent instead of hardcoded to "Marvin"
+# in logic; relay has no such key and is unaffected. In-memory only —
+# a restart resetting the count to 0 just means one extra reminder
+# fires sooner than strictly necessary, harmless.
+agent_voice_reminder_turn_count: Dict[str, int] = {}
 active_todo_messages: Dict[str, Dict] = {}
 # Per-channel cooldown tracking for the queued-ack sweep (Task #13). Not
 # persisted — a restart clearing this is fine, worst case one channel
@@ -1824,6 +1843,29 @@ def load_persona_files(agent: str) -> str:
     return "\n\n".join(persona_parts)
 
 
+def load_voice_reminder(agent: str) -> str:
+    """Load the compact, periodically-reinjected voice reminder for
+    `agent`, if one exists. Deliberately NOT under agents/<agent>/persona/
+    — load_persona_files() globs every *.md there into the one-time
+    --append-system-prompt block, and this file's whole point is to be
+    something else: a short excerpt re-surfaced close to generation on a
+    cadence (see agent_voice_reminder_turn_count above), not baked into
+    the system prompt where it just dilutes at the same rate as
+    everything else. Re-read from disk each call rather than cached —
+    called at most once per qualifying turn, file is a few hundred
+    bytes, and it means an edit takes effect on the very next reminder
+    without a subprocess restart.
+    """
+    path = WORKSPACE_ROOT / "agents" / agent / "voice_reminder.md"
+    if not path.exists():
+        return ""
+    try:
+        return path.read_text().strip()
+    except Exception as e:
+        log.warning(f"Failed to read voice reminder for {agent}: {e}")
+        return ""
+
+
 def load_memory_index(agent: str) -> str:
     """Load the routing-table-only memory index (MEMORY.md), never the fact
     bodies it points at. Schema and this constraint ported from Amos (Mike's
@@ -3096,6 +3138,8 @@ async def process_agent_queue(agent: str):
         if agent_states.get(agent) != "IDLE":
             return
 
+        config = agent_config.get(agent, {})
+
         # Rate-limit circuit breaker (2026-08-07) — checked before
         # touching message_queue at all. Paused messages stay
         # STATUS_QUEUED untouched; rate_limit_gate_sweep_loop is what
@@ -3322,6 +3366,24 @@ async def process_agent_queue(agent: str):
                         f"more message(s) have landed live in {channel_label} "
                         f"since then, fetched fresh rather than relying on a "
                         f"stale snapshot:]\n" + "\n\n".join(recent_lines)
+                    )
+
+        # Periodic voice reminder (2026-09-08, Ian — see
+        # agent_voice_reminder_turn_count above for the full rationale).
+        # Deliberately appended LAST, after everything else above,
+        # because the goal is proximity to generation — recency in the
+        # prompt, not just presence somewhere in it. interval <= 0 or
+        # missing means the agent opted out (relay, and any future agent
+        # without the key); interval == 1 fires every turn.
+        voice_reminder_interval = config.get("voice_reminder_interval", 0)
+        if voice_reminder_interval and voice_reminder_interval > 0:
+            turn_count = agent_voice_reminder_turn_count.get(agent, 0) + 1
+            agent_voice_reminder_turn_count[agent] = turn_count
+            if turn_count % voice_reminder_interval == 0:
+                reminder_text = load_voice_reminder(agent)
+                if reminder_text:
+                    formatted_parts.append(
+                        f"<system-reminder>\n{reminder_text}\n</system-reminder>"
                     )
 
         formatted_content = "\n\n".join(formatted_parts)
