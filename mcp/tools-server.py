@@ -8,6 +8,7 @@ dispatches to skill scripts, maintains audit trail.
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -255,6 +256,13 @@ def discover_skills() -> list[dict]:
 # Input Validation
 # =============================================================================
 
+# A ".." path-traversal segment, matched only when it's actually acting
+# as a path segment: preceded/followed by a `/` or `\`, or standing
+# alone as the entire value. See the comment inline at its use site
+# (task-1788231060) for why a bare substring check was wrong.
+_PATH_TRAVERSAL_RE = re.compile(r'(?:^|[/\\])\.\.(?:[/\\]|$)')
+
+
 def validate_args(args: dict, schema: dict) -> str | None:
     """Basic JSON Schema validation. Returns error message or None."""
     if schema.get("type") != "object":
@@ -287,8 +295,24 @@ def validate_args(args: dict, schema: dict) -> str | None:
         if "enum" in prop_schema and value not in prop_schema["enum"]:
             return f"Field '{key}' must be one of: {prop_schema['enum']}"
 
-        # Path safety (reject traversal unless explicitly allowed)
-        if isinstance(value, str) and ".." in value:
+        # Path safety (reject traversal unless explicitly allowed).
+        #
+        # task-1788231060 (2026-09-01): this used to be a bare `".." in
+        # value` substring check applied to every string field on every
+        # tool, including free-form prose fields like queue_outbox_message's
+        # `content` — no schema in this repo has ever set path_mode, so
+        # the opt-out this checked for doesn't exist anywhere either.
+        # Ordinary text hits ".." constantly (an informal ".." instead of
+        # an ellipsis, a filename's own dot butting up against a
+        # sentence-ending period, a version string) with zero path
+        # traversal involved, and every hit was a real false positive:
+        # two logged incidents, no actual attack. Real traversal payloads
+        # are a ".." segment adjacent to a path separator (`../`, `..\`,
+        # or `..` as a whole path segment) — tightening to that shape
+        # keeps the protection for any future tool that actually takes a
+        # caller-supplied path, without flagging prose that merely
+        # contains two dots somewhere.
+        if isinstance(value, str) and _PATH_TRAVERSAL_RE.search(value):
             if not prop_schema.get("path_mode") == "absolute":
                 return f"Field '{key}' contains path traversal"
 

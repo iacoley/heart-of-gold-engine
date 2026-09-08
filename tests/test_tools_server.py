@@ -99,6 +99,60 @@ def test_skill_dir_with_neither_file_is_silently_ignored(tools_server, tmp_path,
     assert capsys.readouterr().err == ""
 
 
+class TestPathTraversalValidation:
+    """task-1788231060: the old check (bare `".." in value`) false-positived
+    on ordinary prose twice in one night — no tool schema in this repo has
+    ever set path_mode, so the intended opt-out was dead code and every
+    string field on every tool got the path-traversal check whether or not
+    it was ever meant to hold a path. Tightened to require ".." to actually
+    be acting as a path segment (adjacent to a separator, or the whole
+    value)."""
+
+    SCHEMA = {
+        "type": "object",
+        "properties": {"content": {"type": "string"}},
+        "required": ["content"],
+    }
+
+    def test_ordinary_prose_with_two_dots_is_not_flagged(self, tools_server):
+        # The exact shape of the real 2026-09-01 false positives: a
+        # filename's own dot butting up against a sentence-ending period,
+        # and an informal ".." used where an ellipsis belongs.
+        assert tools_server.validate_args(
+            {"content": "see reply_gate.py.. still not sure"}, self.SCHEMA
+        ) is None
+        assert tools_server.validate_args(
+            {"content": "closes task-1788231060.. finally"}, self.SCHEMA
+        ) is None
+
+    def test_real_traversal_segment_is_still_flagged(self, tools_server):
+        error = tools_server.validate_args(
+            {"content": "../../config/agents.json"}, self.SCHEMA
+        )
+        assert error is not None
+        assert "path traversal" in error
+
+    def test_bare_dotdot_segment_is_still_flagged(self, tools_server):
+        error = tools_server.validate_args({"content": ".."}, self.SCHEMA)
+        assert error is not None
+
+    def test_traversal_inside_a_longer_path_is_still_flagged(self, tools_server):
+        error = tools_server.validate_args(
+            {"content": "data/foo/../../secrets.env"}, self.SCHEMA
+        )
+        assert error is not None
+
+    def test_path_mode_absolute_still_opts_out(self, tools_server):
+        schema = {
+            "type": "object",
+            "properties": {"content": {"type": "string", "path_mode": "absolute"}},
+            "required": ["content"],
+        }
+        assert tools_server.validate_args(
+            {"content": "../../config/agents.json"}, schema
+        ) is None
+
+
 class TestTaskboardUpdate:
     """taskboard's 'update' action was advertised in the tool schema
     (description + inputSchema enum) but never implemented in
