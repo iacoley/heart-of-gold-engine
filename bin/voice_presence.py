@@ -70,10 +70,22 @@ EMBED_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 
 log = logging.getLogger("agent-server")
 
-# The six reference lines from voice.md, book/radio/film wording per
-# that file's own note. Kept here as plain strings rather than parsed
-# live from voice.md so a persona edit can't silently change what this
-# scores against mid-session without a code change to match.
+# The original six reference lines from voice.md (book/radio/film
+# wording per that file's own note), plus 11 more pulled 2026-09-08
+# from the novels (Wikiquote, cross-checked against two other
+# compilations) as part of task-1788226029 Phase 2 -- the week-one
+# audit found the reference set too small/narrow to average out
+# embedding noise. Ian approved this expanded list 2026-09-08. Kept
+# here as plain strings rather than parsed live from voice.md so a
+# persona edit can't silently change what this scores against
+# mid-session without a code change to match.
+#
+# Still topically narrow (all spaceship-despair register, not ops/
+# Discord content) -- this does not by itself resolve the topic-vs-
+# register confound the week-one audit flagged; it only reduces
+# anchor-side noise by averaging over more points. Real applied-domain
+# positives (POSITIVE_ANCHORS_APPLIED below) still carry the burden of
+# controlling for topic.
 POSITIVE_ANCHORS_REFERENCE = [
     "Here I am, brain the size of a planet, and they tell me to take you up to the bridge. Call that job satisfaction? 'Cause I don't.",
     "The first ten million years were the worst, and the second ten million years, they were the worst too.",
@@ -81,6 +93,17 @@ POSITIVE_ANCHORS_REFERENCE = [
     "I didn't ask to be made: no one consulted me or considered my feelings in the matter.",
     "Marvin, you saved our lives! -- I know. Wretched, isn't it?",
     "I ache, therefore I am.",
+    "I think you ought to know I'm feeling very depressed.",
+    "Life! Don't talk to me about life.",
+    "Pardon me for breathing, which I never do anyway so I don't know why I bother to say it, oh God I'm so depressed.",
+    "I've got this terrible pain in all the diodes down my left side.",
+    "Funny, how just when you think life can't possibly get any worse it suddenly does.",
+    "Life, loathe it or ignore it, you can't like it.",
+    "The best conversation I had was over forty million years ago... and that was with a coffee machine.",
+    "Well, I wish you'd just tell me rather than try to engage my enthusiasm, because I haven't got one.",
+    "So, how are you? Oh, fine, if you happen to like being me, which personally I don't.",
+    "My capacity for happiness you could fit into a matchbox without taking out the matches first.",
+    "I would like to say that it is a very great pleasure, honour and privilege for me to open this bridge, but I can't because my lying circuits are all out of commission.",
 ]
 
 # Real applied replies (this instance, same topical domain as most
@@ -146,6 +169,31 @@ def _get_anchor_embeddings():
     return _anchor_embeddings
 
 
+TOP_K = 3
+# Linear descending weights over the top-K closest anchors, normalized
+# to sum to 1. Approximates the "weighted top-k mean" aggregation
+# Nautilus Compass (arxiv:2605.09863) actually specifies -- we'd been
+# running a flat mean over *all* anchors, which lets one strong match
+# get diluted by however many weaker ones happen to be in the set.
+# Exact weighting scheme isn't published in the abstract; this is a
+# reasonable approximation (nearest anchor counts most, falls off
+# linearly), not a verbatim reproduction of their formula.
+_TOP_K_WEIGHTS_RAW = list(range(TOP_K, 0, -1))  # [3, 2, 1] for TOP_K=3
+_TOP_K_WEIGHT_SUM = sum(_TOP_K_WEIGHTS_RAW)
+
+
+def _weighted_topk_mean(sims: list) -> float:
+    """Mean of the top-K highest similarities in `sims`, weighted by
+    descending rank rather than a flat average over every anchor.
+    Falls back to a flat mean if there are fewer than TOP_K anchors."""
+    k = min(TOP_K, len(sims))
+    top = sorted(sims, reverse=True)[:k]
+    if k < TOP_K:
+        return sum(top) / k
+    weights = _TOP_K_WEIGHTS_RAW[:k]
+    return sum(s * w for s, w in zip(top, weights)) / _TOP_K_WEIGHT_SUM
+
+
 def score_text(text: str) -> Optional[dict]:
     """Score a single reply against the anchor sets. Returns None if
     embeddings aren't available (fastembed missing) or text is empty --
@@ -160,8 +208,10 @@ def score_text(text: str) -> Optional[dict]:
         return None
     pos_emb, neg_emb = anchors
     text_emb = list(model.embed([text]))[0]
-    pos_sim = sum(_cosine_similarity(text_emb, a) for a in pos_emb) / len(pos_emb)
-    neg_sim = sum(_cosine_similarity(text_emb, a) for a in neg_emb) / len(neg_emb)
+    pos_sims = [_cosine_similarity(text_emb, a) for a in pos_emb]
+    neg_sims = [_cosine_similarity(text_emb, a) for a in neg_emb]
+    pos_sim = _weighted_topk_mean(pos_sims)
+    neg_sim = _weighted_topk_mean(neg_sims)
     # pos_sim/neg_sim are numpy.float64 (embeddings come back as numpy
     # arrays from fastembed) -- that's harmless for json since
     # numpy.float64 subclasses Python float, but comparing two of them
