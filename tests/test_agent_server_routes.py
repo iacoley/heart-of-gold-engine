@@ -137,3 +137,23 @@ def test_handle_agents_reports_config_not_just_runtime_state():
 
     assert '"max_turns": config.get("max_turns", 200)' in body
     assert '"timeout": config.get("timeout")' in body
+
+
+def test_voice_presence_scoring_gated_on_persona():
+    """Found 2026-09-09: _voice_presence_log() fired for every agent
+    unconditionally, including relay, which has no agents/relay/persona/
+    directory and was never meant to have one. Every relay reply got
+    judged against JUDGE_VOICE_DESCRIPTION's hardcoded "Marvin's voice"
+    rubric and failed 100% of the time (43/43 in the judge-verified
+    data) — that's not a voice-presence signal, it's a category error,
+    and it single-handedly dragged the aggregate flag rate up enough to
+    make a real problem (none) look severe. Pin the guard so scoring an
+    agent with no persona to hold it to can't silently regress back in."""
+    src = AGENT_SERVER.read_text()
+    assert "def _has_persona(agent: str) -> bool:" in src
+
+    start = src.index("async def _voice_presence_log")
+    end = src.index("\nasync def ", start + 1)
+    body = src[start:end]
+    assert "_has_persona(agent)" in body
+    assert "return" in body.split("_has_persona(agent)")[1].split("\n")[1]

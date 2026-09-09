@@ -455,13 +455,35 @@ def _spawn(coro, name: Optional[str] = None) -> asyncio.Task:
     task.add_done_callback(_on_done)
     return task
 
+def _has_persona(agent: str) -> bool:
+    """True iff `agent` has a non-empty agents/<agent>/persona/*.md file.
+    Same existence check load_onboarding_prompt() already uses to decide
+    whether an agent has an identity yet."""
+    persona_dir = WORKSPACE_ROOT / "agents" / agent / "persona"
+    return persona_dir.exists() and any(
+        f.read_text().strip() for f in persona_dir.glob("*.md") if f.is_file()
+    )
+
+
 async def _voice_presence_log(agent: str, channel: str, text: str) -> None:
     """Wrapper around voice_presence.score_and_log() — as of 2026-09-08
     (task-1788290783) the authoritative verdict comes from a judge-model
     subprocess call (I/O-bound, awaited directly) run alongside the
     embedding score (CPU-bound, thread-offloaded internally); both are
     handled inside score_and_log() itself. Still runs via _spawn() as a
-    background task so neither adds latency to a reply already posted."""
+    background task so neither adds latency to a reply already posted.
+
+    Found 2026-09-09: this was firing for every agent unconditionally,
+    including relay, which has no persona/ directory at all — relay was
+    being judged against JUDGE_VOICE_DESCRIPTION's hardcoded "Marvin's
+    voice" rubric despite never being asked to have one. That's not a
+    signal, it's scoring a toaster on its sense of humor: relay logged
+    43/43 flagged in the judge-verified data, which single-handedly
+    dragged the aggregate flag rate up and made a real problem (none)
+    look like a severe one. Skip scoring entirely for agents with no
+    persona to hold them to."""
+    if not _has_persona(agent):
+        return
     await voice_presence.score_and_log(agent, channel, text)
 
 response_buffers: Dict[str, str] = {}
