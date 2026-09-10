@@ -530,6 +530,19 @@ agent_context_usage: Dict[str, Dict[str, Any]] = {}
 # blocked agent gets one alert per block episode, not one per heartbeat.
 agent_spend_limit_blocked: Dict[str, bool] = {}
 agent_spend_limit_notified: Dict[str, bool] = {}
+# Generic sibling to the pair above (2026-09-10) — see the CLI_SPEND_LIMIT_
+# SIGNATURE comment: that fix covered one specific flat is_error string
+# (the spend-cap message) after it went out verbatim for ~2.5h. A second,
+# different flat is_error string ("Failed to authenticate: OAuth session
+# expired and could not be refreshed" — the CLI's own login session,
+# unrelated to the API/session auth this harness otherwise manages) did
+# the exact same thing for ~6.5h before anyone caught it, because nothing
+# generic existed to catch a fallback string that wasn't that one
+# hardcoded signature. Tracks any *other* is_error result that produced no
+# real assistant content, not a specific string, so a third differently-
+# worded CLI failure doesn't repeat this a third time.
+agent_cli_error_blocked: Dict[str, bool] = {}
+agent_cli_error_notified: Dict[str, bool] = {}
 # Rate-limit override (2026-08-10, Ian's ask: "bugfixes regardless of
 # session limits, at my discretion"). An owner-set, auto-expiring bypass
 # of is_rate_limit_paused() for exactly one agent at a time — for the
@@ -1556,6 +1569,34 @@ async def _notify_spend_limit(agent: str, blocked: bool) -> None:
         await post_to_discord(agent, signals_channel, msg)
     except Exception as e:
         log.warning(f"Spend-limit notice failed (non-fatal): {e}")
+
+async def _notify_cli_error(agent: str, blocked: bool, error_text: str = "") -> None:
+    """#signals alert for the generic CLI-error guard (see
+    agent_cli_error_blocked above). Mirrors _notify_spend_limit's shape —
+    direct ping on the way in since this needs a human to actually look
+    (the CLI's own auth/login session is outside anything this harness can
+    refresh itself), quiet note on the way out. Fires once per episode via
+    agent_cli_error_notified, not once per heartbeat, so a multi-hour
+    outage doesn't spam #signals with an identical alert every 30 minutes
+    the way the underlying bug spammed the *user-facing* channels instead."""
+    try:
+        signals_channel = (channels_config.get("channels", {}).get("signals", {}) or {}).get("id")
+        if not signals_channel:
+            return
+        if blocked:
+            snippet = (error_text or "").strip()[:300]
+            msg = (
+                f"-# 🚫 {agent}'s CLI subprocess is returning an error with no real "
+                f"reply content — held here instead of being posted as if it were "
+                f"{agent} talking. Won't self-resolve; likely needs a human to look "
+                f"at the CLI's own auth/session state. Raw error: `{snippet}` "
+                f"<@{OWNER_DISCORD_ID}>"
+            )
+        else:
+            msg = f"-# {agent}'s CLI error cleared — processing normally again."
+        await post_to_discord(agent, signals_channel, msg)
+    except Exception as e:
+        log.warning(f"CLI-error notice failed (non-fatal): {e}")
 
 async def compact_session(agent: str, reason: str) -> bool:
     """Shared compaction action — finalize (summarize-session.py writes a
@@ -3007,6 +3048,15 @@ async def read_agent_response(
                 if CLI_SPEND_LIMIT_SIGNATURE in final_text:
                     metadata["spend_limit_blocked"] = True
                     final_text = ""
+                elif event.get("is_error") and final_text:
+                    # Generic guard (2026-09-10) — see agent_cli_error_blocked
+                    # above. Any other is_error result with no real assistant
+                    # content is the CLI reporting its own failure (auth,
+                    # network, crash), not the agent saying something; never
+                    # let it through to Discord looking like a reply.
+                    metadata["cli_error_blocked"] = True
+                    metadata["cli_error_text"] = final_text
+                    final_text = ""
                 break
 
     except Exception as e:
@@ -3535,6 +3585,18 @@ async def process_agent_queue(agent: str):
                     agent_spend_limit_blocked[agent] = False
                     agent_spend_limit_notified[agent] = False
                     _spawn(_notify_spend_limit(agent, blocked=False))
+
+                if metadata.get("cli_error_blocked"):
+                    agent_cli_error_blocked[agent] = True
+                    if not agent_cli_error_notified.get(agent):
+                        agent_cli_error_notified[agent] = True
+                        _spawn(_notify_cli_error(
+                            agent, blocked=True, error_text=metadata.get("cli_error_text", "")
+                        ))
+                elif agent_cli_error_blocked.get(agent):
+                    agent_cli_error_blocked[agent] = False
+                    agent_cli_error_notified[agent] = False
+                    _spawn(_notify_cli_error(agent, blocked=False))
 
             # Post whatever's left to Discord. When stream_to_channel is on,
             # most (or all) of response_text already went out incrementally
