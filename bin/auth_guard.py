@@ -19,9 +19,17 @@ Confirmed identical to a 2026-07-19 incident on Amos's side
 his detect-and-survive shape: once a spawn hits the signature, stop
 hammering (don't let every sidecar independently retry into a dead
 token), re-probe on a cooldown instead, and log the transition once
-instead of once per check. It does not and cannot fix rotation itself
-— that needs a real interactive re-login (see Amos's headless
-device-flow relay pattern for that part).
+instead of once per check.
+
+That alone only survives the outage, it doesn't end it — someone still
+had to notice and run a manual re-login. 2026-09-14: Amos (via
+mcarmody2013@gmail.com) handed over the other half he'd already built
+for the identical scar: kick off `claude auth login --claudeai`
+detached, capture the short-lived sign-in link from its first few
+seconds of stdout, and relay it out over Discord before the process's
+own polling loop blocks. See trigger_relogin_relay() below — wired into
+record_failure() so it fires automatically on the first transition into
+an outage, once per outage, no manual intervention required.
 
 State is a small JSON file under WORKSPACE_ROOT/data so it coordinates
 across separate processes (agent-server.py's event loop is not the same
@@ -34,6 +42,7 @@ import fcntl
 import json
 import logging
 import os
+import subprocess
 import time
 from pathlib import Path
 from typing import Optional
@@ -50,7 +59,88 @@ STATE_PATH = WORKSPACE_ROOT / "data" / "auth-guard-state.json"
 # exists to stop.
 PROBE_COOLDOWN_SEC = 120
 
-_DEFAULT_STATE = {"known_bad": False, "last_probe_ts": 0.0, "alerted": False}
+# Amos's recipe, verbatim: the link/device code prints almost
+# immediately, then the process blocks polling for browser completion
+# in the background. 8s is his tested wait, long enough for the link to
+# land in the output file, short enough not to hold up whichever
+# sidecar caller hit the failure and is now blocking in here.
+RELOGIN_WAIT_SEC = 8
+RELOGIN_OUTPUT_PATH = WORKSPACE_ROOT / "data" / "auth-guard-relogin-out.txt"
+RELOGIN_CHANNEL = os.environ.get("AUTH_GUARD_RELOGIN_CHANNEL", "general")
+NOTIFY_SCRIPT = WORKSPACE_ROOT / "bin" / "discord-notify.sh"
+OWNER_DISCORD_ID = os.environ.get("OWNER_DISCORD_ID", "0")
+
+_DEFAULT_STATE = {
+    "known_bad": False,
+    "last_probe_ts": 0.0,
+    "alerted": False,
+    "relogin_triggered": False,
+}
+
+
+def trigger_relogin_relay() -> bool:
+    """Kick off a headless device-flow re-login and relay the sign-in
+    link to Discord so a human can close it out without anyone having
+    to notice the outage and run this by hand.
+
+    Detached (start_new_session) so it survives this process/turn
+    ending — the login itself keeps polling for browser completion in
+    the background long after this function returns. discord-notify.sh
+    is used rather than the MCP discord tool because it's a direct
+    bot-token curl call, independent of the very credentials that just
+    died, so it still works precisely when this is needed.
+
+    Returns True only if the link was both captured and relayed. Best
+    effort throughout: every failure mode here (spawn failed, nothing
+    captured, Discord post failed) is logged and swallowed rather than
+    raised, since the caller is record_failure() and a relogin hiccup
+    must never break the core known_bad bookkeeping it guarantees.
+    """
+    RELOGIN_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(RELOGIN_OUTPUT_PATH, "w") as out:
+            subprocess.Popen(
+                ["claude", "auth", "login", "--claudeai"],
+                stdout=out,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+    except OSError as e:
+        log.error("auth_guard: failed to spawn headless relogin: %s", e)
+        return False
+
+    time.sleep(RELOGIN_WAIT_SEC)
+
+    try:
+        captured = RELOGIN_OUTPUT_PATH.read_text().strip()
+    except OSError as e:
+        log.error("auth_guard: relogin spawned but output unreadable: %s", e)
+        return False
+
+    if not captured:
+        log.error("auth_guard: relogin spawned but captured no output to relay")
+        return False
+
+    message = (
+        f"<@{OWNER_DISCORD_ID}> shared Claude credentials died again "
+        "(OAuth-rotation scar, see auth_guard.py). Headless re-login "
+        "kicked off automatically — the link below is short-lived "
+        "(minutes, not hours), click it now:\n```\n" + captured + "\n```"
+    )
+
+    try:
+        subprocess.run(
+            [str(NOTIFY_SCRIPT), RELOGIN_CHANNEL, message],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+        log.error("auth_guard: relogin link captured but relay to Discord failed: %s", e)
+        return False
+
+    return True
 
 
 def is_auth_failure_signature(text: Optional[str]) -> bool:
@@ -113,6 +203,15 @@ def record_failure() -> bool:
     state["last_probe_ts"] = time.time()
     should_alert = first or not state["alerted"]
     state["alerted"] = True
+    # Claim the relogin trigger in the same write as everything else so
+    # two near-simultaneous callers don't both spawn a device-flow login
+    # (the second would just orphan the first's link, not help anyone).
+    # Still a check-then-act race in principle across the two _write_state
+    # calls above and below, same as the "first" transition check itself
+    # already accepts — narrow window, worst case is a duplicate relogin
+    # attempt, not a missed one.
+    should_relogin = not state["relogin_triggered"]
+    state["relogin_triggered"] = True
     _write_state(state)
     if should_alert:
         log.error(
@@ -121,6 +220,14 @@ def record_failure() -> bool:
             "re-login. Suppressing repeat alerts for this outage; "
             "further failures logged at WARNING until recovery."
         )
+    if should_relogin:
+        try:
+            trigger_relogin_relay()
+        except Exception:
+            # Bookkeeping above already landed regardless of what
+            # happens here — a relogin hiccup must never take down the
+            # one contract every caller actually depends on.
+            log.exception("auth_guard: trigger_relogin_relay() raised")
     return should_alert
 
 
