@@ -76,6 +76,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import auth_guard
+
 WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
 LOG_PATH = WORKSPACE_ROOT / "data" / "voice-presence-log.jsonl"
 EMBED_MODEL_NAME = "BAAI/bge-small-en-v1.5"
@@ -314,8 +316,16 @@ async def judge_voice_presence(text: str) -> Optional[dict]:
     Returns None on any failure (claude binary missing, timeout,
     unparseable output) -- caller treats None as "couldn't judge", same
     convention as score_text() returning None, not as a verdict either
-    way."""
+    way.
+
+    Also returns None without spawning a process at all if auth_guard
+    reports the shared on-disk OAuth token as known-bad and still
+    within its cooldown (2026-09-14 shared-rotation scar) -- no point
+    sending another `claude -p` process to fail the exact same way
+    every sibling already has this outage."""
     if not text or not text.strip():
+        return None
+    if not auth_guard.should_attempt():
         return None
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -332,8 +342,13 @@ async def judge_voice_presence(text: str) -> Optional[dict]:
         log.warning(f"voice_presence: judge call failed: {e}")
         return None
 
+    raw_output = stdout.decode(errors="replace")
+    if auth_guard.is_auth_failure_signature(raw_output):
+        auth_guard.record_failure()
+        return None
+
     answer = ""
-    for line in stdout.decode(errors="replace").splitlines():
+    for line in raw_output.splitlines():
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
@@ -345,6 +360,11 @@ async def judge_voice_presence(text: str) -> Optional[dict]:
     if not answer:
         log.warning("voice_presence: judge call returned no result event")
         return None
+
+    if auth_guard.is_auth_failure_signature(answer):
+        auth_guard.record_failure()
+        return None
+    auth_guard.record_success()
 
     lines = answer.splitlines()
     verdict = lines[0].strip().upper() if lines else ""

@@ -33,6 +33,7 @@ from aiohttp import web
 import speaking_banana as banana
 import context_box
 import voice_presence
+import auth_guard
 from handoff import parse_handoff
 from outbox import add_pending
 
@@ -1697,6 +1698,11 @@ async def classify_topic_change(previous_text: str, new_text: str) -> Optional[b
         "\n\nSECOND (after the gap):\n" + new_text[:1500] +
         "\n\nAnswer with exactly one word: SAME or CHANGED."
     )
+    # 2026-09-14 shared-rotation scar: skip the spawn entirely if the
+    # on-disk OAuth token is already known-bad and still in cooldown —
+    # see auth_guard.py.
+    if not auth_guard.should_attempt():
+        return None
     try:
         proc = await asyncio.create_subprocess_exec(
             "claude", "-p", prompt,
@@ -1712,8 +1718,13 @@ async def classify_topic_change(previous_text: str, new_text: str) -> Optional[b
         log.warning(f"Topic-change classifier call failed: {e}")
         return None
 
+    raw_output = stdout.decode(errors="replace")
+    if auth_guard.is_auth_failure_signature(raw_output):
+        auth_guard.record_failure()
+        return None
+
     answer = ""
-    for line in stdout.decode(errors="replace").splitlines():
+    for line in raw_output.splitlines():
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
@@ -1723,8 +1734,10 @@ async def classify_topic_change(previous_text: str, new_text: str) -> Optional[b
             break
 
     if "CHANGED" in answer:
+        auth_guard.record_success()
         return True
     if "SAME" in answer:
+        auth_guard.record_success()
         return False
     log.warning(f"Topic-change classifier gave an unparseable answer: {answer!r}")
     return None

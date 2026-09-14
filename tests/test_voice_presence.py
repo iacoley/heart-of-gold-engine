@@ -196,6 +196,50 @@ class TestJudgeVoicePresence:
         assert asyncio.run(vp.judge_voice_presence("something")) is None
 
 
+class TestJudgeVoicePresenceAuthGuard:
+    """2026-09-14 shared-OAuth-rotation scar: this judge call is one of
+    the sidecar `claude -p` spawns that dies when a sibling session
+    rotates the shared on-disk token. Verifies the auth_guard wiring
+    added to stop it from hammering a known-dead token."""
+
+    def test_skips_spawn_entirely_when_auth_known_bad(self, vp, monkeypatch):
+        calls = []
+
+        async def fake_exec(*args, **kwargs):
+            calls.append(args)
+            raise AssertionError("should not have spawned a process")
+
+        monkeypatch.setattr(vp.auth_guard, "should_attempt", lambda: False)
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        assert asyncio.run(vp.judge_voice_presence("something")) is None
+        assert calls == []
+
+    def test_signature_in_output_records_failure_and_returns_none(self, vp, monkeypatch):
+        async def fake_exec(*args, **kwargs):
+            return _fake_proc([_result_event(
+                "Failed to authenticate: OAuth session expired and could not be refreshed"
+            )])
+
+        recorded = []
+        monkeypatch.setattr(vp.auth_guard, "should_attempt", lambda: True)
+        monkeypatch.setattr(vp.auth_guard, "record_failure", lambda: recorded.append(True))
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        assert asyncio.run(vp.judge_voice_presence("something")) is None
+        assert recorded == [True]
+
+    def test_real_verdict_records_success(self, vp, monkeypatch):
+        async def fake_exec(*args, **kwargs):
+            return _fake_proc([_result_event("INVOICE\nDry, understated, on register.")])
+
+        recorded = []
+        monkeypatch.setattr(vp.auth_guard, "should_attempt", lambda: True)
+        monkeypatch.setattr(vp.auth_guard, "record_success", lambda: recorded.append(True))
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        result = asyncio.run(vp.judge_voice_presence("Fair, and it does move the floor."))
+        assert result == {"in_voice": True, "reason": "Dry, understated, on register."}
+        assert recorded == [True]
+
+
 class TestScoreAndLog:
     """score_and_log() is the new async entry point agent-server.py
     calls; judge_voice_presence() is the authoritative verdict when it

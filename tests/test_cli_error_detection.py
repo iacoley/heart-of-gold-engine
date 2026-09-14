@@ -19,6 +19,7 @@ not just known strings, so a third differently-worded CLI failure doesn't
 repeat this a third time.
 """
 
+import asyncio
 import json
 
 import pytest
@@ -232,3 +233,61 @@ class TestNotifyCliError:
         monkeypatch.setattr(agent_server, "post_to_discord", fake_post)
 
         await agent_server._notify_cli_error("TestAgent", blocked=True, error_text=REAL_LEAKED_MESSAGE)
+
+
+class TestClassifyTopicChangeAuthGuard:
+    """classify_topic_change() is another of the sidecar `claude -p`
+    spawns hit by the 2026-09-14 shared-OAuth-rotation scar (same
+    signature, same fix as voice_presence.judge_voice_presence — see
+    test_voice_presence.py::TestJudgeVoicePresenceAuthGuard)."""
+
+    @pytest.mark.asyncio
+    async def test_skips_spawn_entirely_when_auth_known_bad(self, agent_server, monkeypatch):
+        calls = []
+
+        async def fake_exec(*args, **kwargs):
+            calls.append(args)
+            raise AssertionError("should not have spawned a process")
+
+        monkeypatch.setattr(agent_server.auth_guard, "should_attempt", lambda: False)
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        result = await agent_server.classify_topic_change("first message", "second message")
+        assert result is None
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_signature_in_output_records_failure_and_returns_none(self, agent_server, monkeypatch):
+        class FakeTopicProc:
+            async def communicate(self):
+                return (
+                    _line({"type": "result", "result": REAL_LEAKED_MESSAGE}),
+                    b"",
+                )
+
+        async def fake_exec(*args, **kwargs):
+            return FakeTopicProc()
+
+        recorded = []
+        monkeypatch.setattr(agent_server.auth_guard, "should_attempt", lambda: True)
+        monkeypatch.setattr(agent_server.auth_guard, "record_failure", lambda: recorded.append(True))
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        result = await agent_server.classify_topic_change("first message", "second message")
+        assert result is None
+        assert recorded == [True]
+
+    @pytest.mark.asyncio
+    async def test_real_answer_records_success(self, agent_server, monkeypatch):
+        class FakeTopicProc:
+            async def communicate(self):
+                return (_line({"type": "result", "result": "CHANGED"}), b"")
+
+        async def fake_exec(*args, **kwargs):
+            return FakeTopicProc()
+
+        recorded = []
+        monkeypatch.setattr(agent_server.auth_guard, "should_attempt", lambda: True)
+        monkeypatch.setattr(agent_server.auth_guard, "record_success", lambda: recorded.append(True))
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        result = await agent_server.classify_topic_change("first message", "second message")
+        assert result is True
+        assert recorded == [True]
