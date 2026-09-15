@@ -1125,12 +1125,14 @@ class DiscordAdapter(discord.Client):
             since = now - self._restart_server_last_run
             if since < RESTART_SERVER_COOLDOWN_SEC:
                 remaining = RESTART_SERVER_COOLDOWN_SEC - since
+                log.info(f"restart-server: cooldown active, {remaining:.0f}s left (requested by {author})")
                 return (f"**/sys restart-server**: cooldown active, "
                         f"{remaining:.0f}s left since the last attempt.")
 
         pending = self._restart_server_pending
         if pending is None or (now - pending["armed_at"]) > RESTART_SERVER_CONFIRM_WINDOW_SEC:
             self._restart_server_pending = {"armed_at": now, "author": author}
+            log.info(f"restart-server: armed, awaiting confirm within {RESTART_SERVER_CONFIRM_WINDOW_SEC}s (requested by {author})")
             return (
                 "**/sys restart-server**: this bounces `agent-server.py` for "
                 "the whole install — every agent, every session (sessions are "
@@ -1139,6 +1141,7 @@ class DiscordAdapter(discord.Client):
                 f"{RESTART_SERVER_CONFIRM_WINDOW_SEC}s to confirm."
             )
         self._restart_server_pending = None  # consumed, one shot
+        log.info(f"restart-server: confirmed by {author}, entering idle-wait")
 
         headers = {"Authorization": f"Bearer {AGENT_SERVER_TOKEN}"}
 
@@ -1173,6 +1176,7 @@ class DiscordAdapter(discord.Client):
             if not not_idle:
                 snapshot = agents
                 pre_boot_id = health.get("boot_id")
+                log.info(f"restart-server: idle confirmed after {int(time.time() - wait_start)}s, sending SIGTERM (pre-boot_id={pre_boot_id})")
                 break
 
             elapsed = time.time() - wait_start
@@ -1187,6 +1191,7 @@ class DiscordAdapter(discord.Client):
                 # direct ping (facts/signals-decisions-need-a-direct-ping-
                 # 2026-08-16.md — a #signals post needing a decision back
                 # is not sufficient on its own) and leave it to a human.
+                log.info(f"restart-server: idle-wait timed out after {int(elapsed)}s ({detail})")
                 add_pending(
                     "signals",
                     f"**/sys restart-server** timed out after {int(elapsed)}s "
@@ -1222,12 +1227,15 @@ class DiscordAdapter(discord.Client):
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
         except Exception as e:
+            log.info(f"restart-server: safe-pkill.sh invocation raised: {e}")
             return f"**/sys restart-server**: failed to invoke safe-pkill.sh: {e}"
 
         self._restart_server_last_run = time.time()
         if proc.returncode != 0:
             output = (stderr or stdout or b"").decode(errors="ignore").strip()
+            log.info(f"restart-server: safe-pkill.sh exited {proc.returncode}: {output}")
             return f"**/sys restart-server**: safe-pkill.sh failed ({output})"
+        log.info("restart-server: SIGTERM sent, polling for new boot_id")
 
         # Poll until agent-server is back, then confirm sessions survived
         # (new PID, same session_ids — the same guarantee /sys reload
@@ -1261,6 +1269,10 @@ class DiscordAdapter(discord.Client):
             preserved = all(
                 post_sessions.get(name) == sid for name, sid in pre_sessions.items()
             )
+            log.info(
+                f"restart-server: new boot_id seen after {int(time.time() - poll_start)}s, "
+                f"sessions {'preserved' if preserved else 'CHANGED'}"
+            )
             return (
                 f"**/sys restart-server**: done in {int(time.time() - poll_start)}s — "
                 f"agent-server back up, sessions "
@@ -1270,6 +1282,7 @@ class DiscordAdapter(discord.Client):
         # No response within the timeout: this now has the same external
         # signature as a crash-loop, not a clean bounce — say so plainly
         # rather than a soft "might still be starting" (spec's step 6).
+        log.warning(f"restart-server: no new boot_id within {RESTART_SERVER_POST_RESTART_TIMEOUT_SEC}s post-SIGTERM — looks like a crash-loop")
         return (
             f"**/sys restart-server**: sent SIGTERM but agent-server hasn't "
             f"responded within {RESTART_SERVER_POST_RESTART_TIMEOUT_SEC}s — "
