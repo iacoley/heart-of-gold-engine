@@ -20,6 +20,7 @@ to avoid.
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -37,11 +38,18 @@ def run_script(*args, timeout=15):
 
 
 class TestCheckHfOffline:
-    def test_passes_against_repo_venv_where_huggingface_hub_is_installed(self):
+    def test_passes_against_an_interpreter_with_huggingface_hub_installed(self):
         """The real regression case this guards: huggingface_hub is a
-        genuine dormant dep in this repo's own .venv (via fastembed) --
-        confirm offline mode actually blocks it, today, for real."""
-        result = run_script()
+        genuine dormant dep here (via fastembed, in requirements.txt) --
+        confirm offline mode actually blocks it, today, for real.
+
+        Uses sys.executable rather than a hardcoded .venv path: locally
+        that's this repo's own .venv, in CI it's the interpreter the
+        workflow just ran `pip install -r requirements.txt` into (no
+        .venv exists in a fresh CI checkout at all) -- either way it's
+        guaranteed to be *some* interpreter with huggingface_hub
+        actually installed, which is the only thing this test needs."""
+        result = run_script(sys.executable)
         assert result.returncode == 0, result.stdout + result.stderr
         assert "OK" in result.stdout
 
@@ -62,13 +70,27 @@ class TestCheckHfOffline:
         assert result.returncode == 1
         assert "not found" in result.stderr
 
-    def test_defaults_to_repo_venv_when_no_arg_given(self):
-        """No interpreter arg -- should resolve to $WORKSPACE_ROOT/.venv,
-        which does have huggingface_hub installed here."""
+    def test_defaults_to_workspace_root_venv_when_no_arg_given(self, tmp_workspace):
+        """No interpreter arg -- should resolve to $WORKSPACE_ROOT/.venv/
+        bin/python3. Exercised against a fake workspace with that path
+        symlinked to sys.executable rather than this repo's real .venv,
+        since a fresh checkout (CI included) has no .venv at all -- this
+        is testing the script's own default-resolution logic, not
+        whether a real venv happens to exist here."""
+        # A plain symlink to sys.executable breaks a real venv's
+        # self-location logic (sys.prefix resolves off the invoked
+        # path, not the symlink target, so site-packages silently
+        # stops being found) -- exec through a tiny wrapper instead so
+        # the real interpreter actually runs as itself.
+        venv_python = tmp_workspace / ".venv" / "bin" / "python3"
+        venv_python.parent.mkdir(parents=True)
+        venv_python.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+        venv_python.chmod(0o755)
+
         result = subprocess.run(
             ["bash", str(SCRIPT)],
             capture_output=True, text=True, timeout=15,
-            env={**os.environ, "WORKSPACE_ROOT": str(PACKAGE_ROOT)},
+            env={**os.environ, "WORKSPACE_ROOT": str(tmp_workspace)},
         )
-        assert result.returncode == 0
+        assert result.returncode == 0, result.stdout + result.stderr
         assert "OK" in result.stdout
