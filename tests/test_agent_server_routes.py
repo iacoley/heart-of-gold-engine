@@ -157,3 +157,36 @@ def test_voice_presence_scoring_gated_on_persona():
     body = src[start:end]
     assert "_has_persona(agent)" in body
     assert "return" in body.split("_has_persona(agent)")[1].split("\n")[1]
+
+
+def test_voice_presence_gate_exempts_signals_and_no_persona_agents():
+    """task-1788316504: the blocking pre-send gate must never hold up a
+    post to #signals (voice.md's own hard boundary — recede for real
+    urgency, this is the live-incident channel) and must skip agents
+    with no persona/ directory, same reasoning and same guard as the
+    log-only _voice_presence_log path above it."""
+    src = AGENT_SERVER.read_text()
+    start = src.index("async def _voice_presence_gate")
+    end = src.index("\nasync def ", start + 1)
+    body = src[start:end]
+
+    assert 'channel == "signals"' in body
+    assert "_has_persona(agent)" in body
+    guard_line = [
+        line for line in body.splitlines()
+        if 'channel == "signals"' in line and "_has_persona(agent)" in line
+    ]
+    assert guard_line, "expected a single combined guard line exempting #signals and no-persona agents"
+    assert "return text" in body.split(guard_line[0])[1].split("\n")[1]
+
+
+def test_voice_presence_gate_wired_in_before_discord_post():
+    """The gate has to run on pending_final before post_to_discord() is
+    called, and before the banana claim emoji is prepended (the emoji is
+    a protocol marker, not persona content — it shouldn't be fed through
+    a voice rewrite or stripped by one)."""
+    src = AGENT_SERVER.read_text()
+    call_idx = src.index("to_post = await _voice_presence_gate(agent, channel_name, to_post)")
+    prepend_idx = src.index("to_post = f\"{banana.CLAIM_EMOJI} {to_post}\"")
+    post_idx = src.index("discord_msg_id = await post_to_discord(agent, channel_id, to_post)")
+    assert call_idx < prepend_idx < post_idx

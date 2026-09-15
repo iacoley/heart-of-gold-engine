@@ -64,6 +64,19 @@ def _wire_common(agent_server, monkeypatch, response_text, mock_claim_self):
     monkeypatch.setattr(agent_server, "stop_typing", _noop)
     monkeypatch.setattr(agent_server, "send_to_agent", _noop)
 
+    # _voice_presence_gate (task-1788316504) now sits between pending_final
+    # and the claim-emoji prepend this file tests — unmocked, it calls the
+    # real voice_presence.gate_and_rewrite(), which spawns an actual `claude`
+    # subprocess (persona/*.md exists for the real "Marvin" this fixture
+    # uses, so _has_persona() doesn't skip it). That hung/failed against
+    # every test here since none of them ever meant to exercise voice
+    # judging — pass the text through unchanged, same as a "judge call
+    # failed, post as-is" real-world outcome.
+    async def _passthrough_gate(agent, channel, text):
+        return text
+
+    monkeypatch.setattr(agent_server, "_voice_presence_gate", _passthrough_gate)
+
     async def _mock_read_agent_response(agent, channel_id, message_ids):
         return (response_text, {"turn": 1}, response_text, None)
 

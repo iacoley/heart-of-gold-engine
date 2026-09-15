@@ -487,6 +487,41 @@ async def _voice_presence_log(agent: str, channel: str, text: str) -> None:
         return
     await voice_presence.score_and_log(agent, channel, text)
 
+
+async def _voice_presence_gate(agent: str, channel: str, text: str) -> str:
+    """Blocking pre-send gate, task-1788316504. Judges `text` against
+    voice_presence's voice rubric and attempts one rewrite if it's
+    flagged flat -- unlike _voice_presence_log above (fire-and-forget,
+    diagnostic only), this one is awaited before the Discord post and
+    its return value is what actually goes out.
+
+    Same _has_persona() skip as the log-only path above, for the same
+    reason: scoring an agent with no persona/ against the hardcoded
+    voice rubric isn't a signal, and gating on it would rewrite e.g.
+    relay's replies into a voice it was never asked to have.
+
+    Exempt from #signals regardless of persona -- voice.md's own hard
+    boundary (recede for real urgency, live-incident channel) shouldn't
+    wait on a haiku subprocess round-trip before an alert goes out.
+
+    Fails open on any judge/rewrite failure (auth outage, timeout,
+    unparseable output) -- same posture as every other voice_presence
+    entry point: couldn't judge is not a verdict, post what the model
+    actually wrote rather than block or substitute something worse."""
+    if channel == "signals" or not _has_persona(agent):
+        return text
+    try:
+        gated_text, meta = await voice_presence.gate_and_rewrite(text)
+    except Exception as e:
+        log.warning(f"[voice-gate] {agent}/{channel}: gate call failed, posting as-is: {e}")
+        return text
+    action = meta.get("gate_action")
+    if action == "rewritten":
+        log.info(f"[voice-gate] {agent}/{channel}: rewrote a flagged-flat reply ({meta.get('original_reason')!r})")
+    elif action == "rewrite_failed":
+        log.info(f"[voice-gate] {agent}/{channel}: flagged flat but rewrite failed, posting original ({meta.get('original_reason')!r})")
+    return gated_text
+
 response_buffers: Dict[str, str] = {}
 agent_last_cost: Dict[str, float] = {}
 agent_sessions: Dict[str, str] = {}
@@ -2089,12 +2124,21 @@ async def start_agent_subprocess(agent: str):
         f"session={session_id[:8]}, {'resuming' if resuming else 'new session'})"
     )
 
+    # MCP servers (tools-server.py etc.) are spawned by the Claude CLI as
+    # children of this subprocess and inherit its environment. AGENT_NAME
+    # is how they find out which agent they're serving — e.g. the
+    # `session` tool's finalize action needs an agent name to pass to
+    # summarize-session.py and otherwise has no way to know it wasn't
+    # relay that called it.
+    subprocess_env = {**os.environ, "AGENT_NAME": agent}
+
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=subprocess_env,
             # Found live 2026-08-07: asyncio's default StreamReader limit is
             # 64KiB per line, and stream-json emits one JSON object per
             # line — a single large tool result or Skill-file dump easily
@@ -3683,6 +3727,7 @@ async def process_agent_queue(agent: str):
                     # mirrors banana.starts_with_claim's own leading-whitespace
                     # tolerance) so this never double-stamps.
                     to_post = pending_final
+                    to_post = await _voice_presence_gate(agent, channel_name, to_post)
                     if held_post_banana and not to_post.lstrip().startswith(banana.CLAIM_EMOJI):
                         to_post = f"{banana.CLAIM_EMOJI} {to_post}"
                     discord_msg_id = await post_to_discord(agent, channel_id, to_post)

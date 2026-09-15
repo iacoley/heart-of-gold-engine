@@ -353,19 +353,46 @@ def handle_core_tool(tool_name: str, args: dict) -> dict:
     elif tool_name == "session":
         action = args.get("action", "load_last")
         if action == "finalize":
+            # summarize-session.py takes the agent name as a required
+            # positional arg (see agent-server.py's compact_session, the
+            # other caller, which always passes one). This tool used to
+            # call it with none at all, so every invocation failed at
+            # argparse before doing anything, and the returncode!=0 branch
+            # below reported only stdout — argparse's usage/error text
+            # goes to stderr, so the failure surfaced as a bare
+            # {"status": "error", "output": ""} with no way to diagnose
+            # it. AGENT_NAME is set on this process's env by
+            # start_agent_subprocess() in agent-server.py specifically so
+            # MCP children can tell which agent they're serving.
+            agent = os.environ.get("AGENT_NAME")
+            if not agent:
+                return {"status": "error",
+                        "output": "AGENT_NAME not set in environment — "
+                                  "can't tell summarize-session.py which "
+                                  "agent's session to finalize."}
             try:
                 result = subprocess.run(
-                    ["python3", str(WORKSPACE / "bin" / "summarize-session.py")],
-                    capture_output=True, text=True, timeout=30, cwd=str(WORKSPACE)
+                    ["python3", str(WORKSPACE / "bin" / "summarize-session.py"), agent],
+                    capture_output=True, text=True, timeout=75, cwd=str(WORKSPACE)
                 )
-                return {"status": "ok" if result.returncode == 0 else "error",
-                        "output": result.stdout.strip()}
+                if result.returncode == 0:
+                    return {"status": "ok", "output": result.stdout.strip()}
+                return {"status": "error",
+                        "output": (result.stderr.strip() or result.stdout.strip()
+                                   or f"exited {result.returncode} with no output")}
             except Exception as e:
-                return {"error": str(e)}
+                return {"status": "error", "output": str(e)}
         elif action == "load_last":
-            # Check for session summary files
+            # Check for session summary files. Scoped to AGENT_NAME when
+            # set (same env var the finalize fix above relies on) --
+            # otherwise this was globbing *every* agent's summary file
+            # and alphabetically-sorting them ("relay" > "Marvin"), so
+            # Marvin calling this could silently get relay's summary
+            # back instead of not_found or his own.
             data_dir = WORKSPACE / "data"
-            summaries = sorted(data_dir.glob("last-session-summary-*.md"))
+            agent = os.environ.get("AGENT_NAME")
+            pattern = f"last-session-summary-{agent}.md" if agent else "last-session-summary-*.md"
+            summaries = sorted(data_dir.glob(pattern))
             if summaries:
                 latest = summaries[-1]
                 age_hours = (time.time() - latest.stat().st_mtime) / 3600

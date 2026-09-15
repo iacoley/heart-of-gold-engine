@@ -75,6 +75,17 @@ def _wire_happy_path(agent_server, monkeypatch, snapshot_ids):
     monkeypatch.setattr(agent_server, "stop_typing", _noop)
     monkeypatch.setattr(agent_server, "send_to_agent", _noop)
 
+    # _voice_presence_gate (task-1788316504) sits right before the Discord
+    # post this file's assertions inspect. Unmocked it calls the real
+    # voice_presence.gate_and_rewrite() -> a real `claude` subprocess (this
+    # fixture's "Marvin" has real persona/*.md on disk, so _has_persona()
+    # doesn't skip it) -- pass the text through unchanged rather than pay
+    # for or depend on a live judge call none of these tests are about.
+    async def _passthrough_gate(agent, channel, text):
+        return text
+
+    monkeypatch.setattr(agent_server, "_voice_presence_gate", _passthrough_gate)
+
     async def _fake_read_agent_response(agent, channel_id, message_ids):
         return "hello there", {"input_tokens": 1}, "hello there", None
 

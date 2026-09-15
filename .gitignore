@@ -26,5 +26,8 @@ __pycache__/
 *.egg-info/
 .venv/
 
+# External reference clones — synced separately, not vendored into our history
+external/
+
 # OS cruft
 .DS_Store

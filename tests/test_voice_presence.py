@@ -300,3 +300,117 @@ class TestScoreAndLog:
         with caplog.at_level("WARNING"):
             asyncio.run(vp.score_and_log("Marvin", "general", "a generic reply"))
         assert any("voice-presence" in r.message for r in caplog.records)
+
+
+class TestRewriteForVoice:
+    """task-1788316504's one-shot rewrite attempt for a reply
+    judge_voice_presence() flagged flat. Same mocked-subprocess approach
+    as TestJudgeVoicePresence -- no real model call in CI."""
+
+    def test_empty_text_returns_none(self, vp):
+        assert asyncio.run(vp.rewrite_for_voice("", "flat")) is None
+        assert asyncio.run(vp.rewrite_for_voice("   ", "flat")) is None
+
+    def test_successful_rewrite_returns_text(self, vp, monkeypatch):
+        async def fake_exec(*args, **kwargs):
+            return _fake_proc([_result_event("That's not a bug, that's Tuesday.")])
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        result = asyncio.run(vp.rewrite_for_voice("The task completed successfully.", "generic"))
+        assert result == "That's not a bug, that's Tuesday."
+
+    def test_no_result_event_returns_none(self, vp, monkeypatch):
+        async def fake_exec(*args, **kwargs):
+            return _fake_proc([json.dumps({"type": "system"})])
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        assert asyncio.run(vp.rewrite_for_voice("something", "generic")) is None
+
+    def test_subprocess_failure_returns_none_not_raises(self, vp, monkeypatch):
+        async def fake_exec(*args, **kwargs):
+            raise OSError("claude binary not found")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        assert asyncio.run(vp.rewrite_for_voice("something", "generic")) is None
+
+    def test_skips_spawn_entirely_when_auth_known_bad(self, vp, monkeypatch):
+        calls = []
+
+        async def fake_exec(*args, **kwargs):
+            calls.append(args)
+            raise AssertionError("should not have spawned a process")
+
+        monkeypatch.setattr(vp.auth_guard, "should_attempt", lambda: False)
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        assert asyncio.run(vp.rewrite_for_voice("something", "generic")) is None
+        assert calls == []
+
+    def test_auth_failure_signature_records_failure_and_returns_none(self, vp, monkeypatch):
+        async def fake_exec(*args, **kwargs):
+            return _fake_proc([_result_event(
+                "Failed to authenticate: OAuth session expired and could not be refreshed"
+            )])
+
+        recorded = []
+        monkeypatch.setattr(vp.auth_guard, "should_attempt", lambda: True)
+        monkeypatch.setattr(vp.auth_guard, "record_failure", lambda: recorded.append(True))
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        assert asyncio.run(vp.rewrite_for_voice("something", "generic")) is None
+        assert recorded == [True]
+
+
+class TestGateAndRewrite:
+    """gate_and_rewrite() is the function agent-server.py's blocking
+    pre-send gate actually calls: judge, and if flagged flat, exactly
+    one rewrite attempt -- never a loop, never a second judge call on
+    the rewrite itself (task-1788316504's scoping note)."""
+
+    def test_in_voice_passes_through_unchanged(self, vp, monkeypatch):
+        async def fake_judge(text):
+            return {"in_voice": True, "reason": "dry, on register"}
+
+        async def fake_rewrite(text, reason):
+            raise AssertionError("should not attempt a rewrite when already in voice")
+
+        monkeypatch.setattr(vp, "judge_voice_presence", fake_judge)
+        monkeypatch.setattr(vp, "rewrite_for_voice", fake_rewrite)
+        text, meta = asyncio.run(vp.gate_and_rewrite("Fair, and it does move the floor."))
+        assert text == "Fair, and it does move the floor."
+        assert meta["gate_action"] == "passed"
+
+    def test_unjudged_passes_through_unchanged(self, vp, monkeypatch):
+        async def fake_judge(text):
+            return None
+
+        monkeypatch.setattr(vp, "judge_voice_presence", fake_judge)
+        text, meta = asyncio.run(vp.gate_and_rewrite("some reply"))
+        assert text == "some reply"
+        assert meta["gate_action"] == "skipped_unjudged"
+
+    def test_flagged_flat_returns_successful_rewrite(self, vp, monkeypatch):
+        async def fake_judge(text):
+            return {"in_voice": False, "reason": "reads generic"}
+
+        async def fake_rewrite(text, reason):
+            assert reason == "reads generic"
+            return "Wretched, isn't it."
+
+        monkeypatch.setattr(vp, "judge_voice_presence", fake_judge)
+        monkeypatch.setattr(vp, "rewrite_for_voice", fake_rewrite)
+        text, meta = asyncio.run(vp.gate_and_rewrite("Task completed successfully."))
+        assert text == "Wretched, isn't it."
+        assert meta["gate_action"] == "rewritten"
+        assert meta["original_reason"] == "reads generic"
+
+    def test_flagged_flat_falls_back_to_original_when_rewrite_fails(self, vp, monkeypatch):
+        async def fake_judge(text):
+            return {"in_voice": False, "reason": "reads generic"}
+
+        async def fake_rewrite(text, reason):
+            return None
+
+        monkeypatch.setattr(vp, "judge_voice_presence", fake_judge)
+        monkeypatch.setattr(vp, "rewrite_for_voice", fake_rewrite)
+        text, meta = asyncio.run(vp.gate_and_rewrite("Task completed successfully."))
+        assert text == "Task completed successfully."
+        assert meta["gate_action"] == "rewrite_failed"

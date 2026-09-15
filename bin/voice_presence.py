@@ -377,6 +377,104 @@ async def judge_voice_presence(text: str) -> Optional[dict]:
     return None
 
 
+REWRITE_PROMPT_TEMPLATE = """Marvin's voice: dry, deadpan, world-weary. A brain that could be doing
+something more interesting than this task, faintly aware of that, but does the work
+correctly anyway without being asked twice. World-weariness is INWARD (scale mismatch:
+big brain, small task) -- NOT sarcasm pointed at the person or topic being discussed.
+Understated, not theatrical -- no stacked punchlines. Confident, not self-deprecating in
+a way that undermines the actual answer.
+
+The reply below was judged flat/generic-ops-bot rather than in-voice. Reason given: {reason}
+
+Rewrite it so it reads like Marvin. Keep every fact, number, and claim exactly as given --
+add nothing, drop nothing, don't hedge or soften anything that was stated plainly. Keep it
+roughly the same length. Output ONLY the rewritten reply, no preamble, no quotes around it,
+no note about what you changed.
+
+ORIGINAL:
+{text}
+"""
+
+
+def _rewrite_prompt(text: str, reason: str) -> str:
+    return REWRITE_PROMPT_TEMPLATE.format(reason=reason or "no reason given", text=text[:1500])
+
+
+async def rewrite_for_voice(text: str, reason: str) -> Optional[str]:
+    """One-shot rewrite attempt for a reply judge_voice_presence() flagged
+    as flat. Same subprocess/auth_guard pattern as judge_voice_presence()
+    above -- deliberately not a loop: task-1788316504's scoping calls for
+    exactly one retry, post the rewrite or fall back to the original,
+    never spin. Returns None on any failure, same "couldn't do it" vs.
+    "verdict" convention as the rest of this module."""
+    if not text or not text.strip():
+        return None
+    if not auth_guard.should_attempt():
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "claude", "-p", _rewrite_prompt(text, reason),
+            "--model", JUDGE_MODEL,
+            "--max-turns", "1",
+            "--output-format", "stream-json",
+            "--verbose",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=JUDGE_TIMEOUT_SEC)
+    except Exception as e:
+        log.warning(f"voice_presence: rewrite call failed: {e}")
+        return None
+
+    raw_output = stdout.decode(errors="replace")
+    if auth_guard.is_auth_failure_signature(raw_output):
+        auth_guard.record_failure()
+        return None
+
+    result_text = ""
+    for line in raw_output.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "result":
+            result_text = (event.get("result", "") or "").strip()
+            break
+
+    if not result_text:
+        log.warning("voice_presence: rewrite call returned no result event")
+        return None
+    if auth_guard.is_auth_failure_signature(result_text):
+        auth_guard.record_failure()
+        return None
+    auth_guard.record_success()
+    return result_text
+
+
+async def gate_and_rewrite(text: str) -> tuple[str, dict]:
+    """Blocking pre-send gate, task-1788316504. Judges `text`; if it's
+    in-voice (or the judge call itself fails -- fail open, same
+    convention as everywhere else in this module), returns it unchanged.
+    If flagged flat, attempts exactly one rewrite and returns that if it
+    succeeds, otherwise falls back to the original text. Never loops,
+    never re-judges the rewrite (that would be a second model call per
+    send on top of the first, for a marginal gain the scoping pass in
+    task-1788316504 decided wasn't worth the latency).
+
+    Caller (agent-server.py's _voice_presence_gate) is responsible for
+    all channel/agent exemptions -- this function has no notion of
+    either and always judges+gates whatever text it's given."""
+    judge_result = await judge_voice_presence(text)
+    if judge_result is None:
+        return text, {"gate_action": "skipped_unjudged"}
+    if judge_result["in_voice"]:
+        return text, {"gate_action": "passed", "reason": judge_result["reason"]}
+    rewritten = await rewrite_for_voice(text, judge_result["reason"])
+    if rewritten:
+        return rewritten, {"gate_action": "rewritten", "original_reason": judge_result["reason"]}
+    return text, {"gate_action": "rewrite_failed", "original_reason": judge_result["reason"]}
+
+
 async def score_and_log(agent: str, channel: str, text: str) -> None:
     """Async replacement for log_score() that uses the judge-model
     verdict as the authoritative 'flagged' call, with the embedding
