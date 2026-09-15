@@ -301,6 +301,25 @@ Don't default to a shared venv "to keep things simple" — it works right
 up until two skills want different major versions of the same
 dependency, and per-skill isolation costs nothing but a bit of disk.
 
+**If the package pulls in `huggingface_hub`** (directly, or transitively
+via `transformers`, `sentence-transformers`, `faster-whisper`, etc.),
+smoke-test offline behavior right after building the venv, before the
+skill ships:
+
+```bash
+bin/check-hf-offline.sh skills/your-skill/.venv/bin/python3
+```
+
+This confirms `HF_HUB_OFFLINE=1` actually blocks a live fetch in that
+interpreter rather than assuming it does — grep-based checks for
+`from_pretrained()`/`snapshot_download()` in your own script won't catch
+a fetch a *dependency* makes internally, and a skill that quietly
+depends on live network access to Hugging Face breaks the moment it
+runs somewhere offline or firewalled. Confirmed 2026-09-14 against this
+repo's own dormant `huggingface_hub` (a transitive dep of `fastembed`,
+used live by the embedding pipeline) — same fix pattern Amos validated
+on his side for voice-transcribe (`faster_whisper`).
+
 ---
 
 ## Resource Access
