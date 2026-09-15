@@ -28,7 +28,6 @@ log.addHandler(handler)
 
 # Component health thresholds (in seconds)
 THRESHOLDS = {
-    "mcp-tools.json": 600,               # 10 minutes
     "relay.json": 300,                    # 5 minutes
     "memory-maintenance.json": 172800,    # 48 hours — was "memory.json",
                                            # a filename that memory-maintenance.py
@@ -36,27 +35,74 @@ THRESHOLDS = {
     "scheduler.json": 300,                 # 5 minutes
 }
 
-# mcp-tools.json is written by mcp/tools-server.py, which isn't a
-# supervisord-managed daemon — it's an MCP stdio server spawned fresh per
-# Claude Code session and only writes its health file once it actually
-# receives a tools/list or tools/call RPC. Some MCP clients discover
-# tools lazily, so a session that never happens to invoke a
-# mcp__karakos-admin__* tool may never trigger that RPC at all. Found
-# 2026-08-07: the alert had fired daily with the file simply absent, and
-# mcp-tools-audit.db (created early in that server's own startup, before
-# any RPC handling) didn't exist either — confirms the process has never
-# run this RPC, not that it crashed after running. "Missing" here means
-# "never used yet," not "down" — don't alert on it. A file that exists
-# and goes stale is still a real problem and still alerts normally.
-OPTIONAL_UNTIL_FIRST_USE = {"mcp-tools.json"}
+# mcp-tools.json is NOT in THRESHOLDS above (task-1788926556, 2026-09-09).
+# It's written by mcp/tools-server.py, which isn't a supervisord-managed
+# daemon — it's an MCP stdio server spawned fresh per Claude Code session
+# that only writes its health file when it actually receives a tools/list
+# or tools/call RPC. That means its mtime measures "was this recently
+# used," not "is this alive": a real instance false-fired at 04:02 that
+# day (10.9 min stale, live probe succeeded immediately) purely because
+# nobody happened to invoke an MCP tool in the preceding window — a
+# usage-pattern gap, not downtime. Same bug class relay.py hit and fixed
+# for its own heartbeat judgment in task-1788216451 (463ec4a): replace
+# file-age with an actual synthetic liveness check. health-monitor.py has
+# no live MCP session of its own to probe the way relay does through its
+# `workspace` tool, so check_mcp_tools_live() below gets the closest
+# equivalent available to a standalone script — see its docstring for
+# the honest scope of what that does and doesn't prove.
+MCP_TOOLS_PROBE_TIMEOUT = 20
+
+def check_mcp_tools_live() -> tuple[bool, str]:
+    """Synthetic liveness probe for mcp/tools-server.py, replacing the
+    old mcp-tools.json file-age check (see note above THRESHOLDS).
+
+    Runs the server's own `--test-tool workspace` mode (a standalone
+    single-tool invocation path already built into tools-server.py,
+    used for its own manual testing) with action="status" — a pure
+    local read, no side effects. A clean exit with valid JSON back is
+    proof the tool-dispatch code path actually works right now.
+
+    Honest scope: this spawns a *fresh* subprocess, not a probe of
+    whichever live per-session tools-server instance Marvin's or
+    relay's active session is actually using — there's no persistent
+    daemon to reach into from a standalone cron script the way relay
+    reaches its own already-connected session. What this catches that
+    the old check couldn't: real breakage (a bad edit, a missing
+    dependency, a crash on startup). What it still can't catch: one
+    specific live session's stdio pipe wedged while the underlying code
+    is fine. Better ground truth than a timestamp either way.
+    """
+    script = WORKSPACE_ROOT / "mcp" / "tools-server.py"
+    try:
+        result = subprocess.run(
+            ["python3", str(script), "--test-tool", "workspace", '{"action": "status"}'],
+            cwd=WORKSPACE_ROOT, capture_output=True, text=True,
+            timeout=MCP_TOOLS_PROBE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"mcp-tools live probe timed out after {MCP_TOOLS_PROBE_TIMEOUT}s"
+    except Exception as e:
+        return False, f"mcp-tools live probe errored: {e}"
+
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        return False, f"mcp-tools live probe exited {result.returncode}: {stderr}"
+
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return False, "mcp-tools live probe returned non-JSON output"
+
+    if "workspace" not in data:
+        return False, f"mcp-tools live probe returned unexpected payload: {data}"
+
+    return True, ""
 
 def check_health_file(component: str, threshold: int) -> tuple[bool, str]:
     """Check if health file is fresh"""
     health_file = HEALTH_DIR / component
 
     if not health_file.exists():
-        if component in OPTIONAL_UNTIL_FIRST_USE:
-            return True, ""
         return False, f"{component} health file missing"
 
     try:
@@ -275,6 +321,11 @@ def main():
         if not healthy:
             log.warning(f"Health check failed: {reason}")
             issues.append(reason)
+
+    mcp_healthy, mcp_reason = check_mcp_tools_live()
+    if not mcp_healthy:
+        log.warning(f"Health check failed: {mcp_reason}")
+        issues.append(mcp_reason)
 
     git_healthy, git_reason = check_git_sync()
     if not git_healthy:

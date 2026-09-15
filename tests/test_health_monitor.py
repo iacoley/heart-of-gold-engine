@@ -80,6 +80,98 @@ class TestHealthFileChecks:
         assert healthy is True
 
 
+class TestMcpToolsLiveProbe:
+    """task-1788926556: mcp-tools.json's file-age check false-fired on a
+    plain usage gap (nobody happened to call an MCP tool in the window),
+    not a real tools-server outage — same bug class relay.py already
+    fixed for its own heartbeat judgment (task-1788216451). Replaced
+    with a synthetic --test-tool invocation; these tests fake
+    subprocess.run rather than actually spawning tools-server.py."""
+
+    def _make_monitor(self, tmp_workspace, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_workspace))
+        return import_script("health-monitor")
+
+    class Result:
+        def __init__(self, stdout="", stderr="", returncode=0):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = returncode
+
+    def test_healthy_when_probe_returns_expected_payload(self, tmp_workspace, monkeypatch):
+        monitor = self._make_monitor(tmp_workspace, monkeypatch)
+
+        def fake_run(args, **kwargs):
+            assert args[:3] == ["python3", str(monitor.WORKSPACE_ROOT / "mcp" / "tools-server.py"), "--test-tool"]
+            return self.Result(stdout=json.dumps({
+                "system_name": "Karakos", "version": "1.0.0",
+                "owner": "User", "workspace": str(monitor.WORKSPACE_ROOT),
+            }))
+
+        monkeypatch.setattr(monitor.subprocess, "run", fake_run)
+
+        healthy, reason = monitor.check_mcp_tools_live()
+        assert healthy is True
+        assert reason == ""
+
+    def test_does_not_false_fire_on_a_plain_usage_gap(self, tmp_workspace, monkeypatch):
+        """The actual regression: no mcp-tools.json activity in 10+
+        minutes used to alert on its own. A successful live probe must
+        report healthy regardless of any file stale in the background —
+        this function never even looks at the health file."""
+        monitor = self._make_monitor(tmp_workspace, monkeypatch)
+        # No data/health/mcp-tools.json written at all -- old code would
+        # have treated this as "missing" (suppressed) or, once it did
+        # exist, stale-by-timestamp. New code doesn't touch the file.
+        monkeypatch.setattr(
+            monitor.subprocess, "run",
+            lambda args, **kw: self.Result(stdout=json.dumps({"workspace": "/opt/karakos"})),
+        )
+        healthy, reason = monitor.check_mcp_tools_live()
+        assert healthy is True
+
+    def test_unhealthy_on_nonzero_exit(self, tmp_workspace, monkeypatch):
+        monitor = self._make_monitor(tmp_workspace, monkeypatch)
+        monkeypatch.setattr(
+            monitor.subprocess, "run",
+            lambda args, **kw: self.Result(stderr="Traceback...", returncode=1),
+        )
+        healthy, reason = monitor.check_mcp_tools_live()
+        assert healthy is False
+        assert "exited 1" in reason
+
+    def test_unhealthy_on_timeout(self, tmp_workspace, monkeypatch):
+        monitor = self._make_monitor(tmp_workspace, monkeypatch)
+
+        def fake_run(args, **kwargs):
+            raise monitor.subprocess.TimeoutExpired(cmd=args, timeout=monitor.MCP_TOOLS_PROBE_TIMEOUT)
+
+        monkeypatch.setattr(monitor.subprocess, "run", fake_run)
+        healthy, reason = monitor.check_mcp_tools_live()
+        assert healthy is False
+        assert "timed out" in reason
+
+    def test_unhealthy_on_malformed_output(self, tmp_workspace, monkeypatch):
+        monitor = self._make_monitor(tmp_workspace, monkeypatch)
+        monkeypatch.setattr(
+            monitor.subprocess, "run",
+            lambda args, **kw: self.Result(stdout="not json"),
+        )
+        healthy, reason = monitor.check_mcp_tools_live()
+        assert healthy is False
+        assert "non-JSON" in reason
+
+    def test_unhealthy_on_unexpected_payload_shape(self, tmp_workspace, monkeypatch):
+        monitor = self._make_monitor(tmp_workspace, monkeypatch)
+        monkeypatch.setattr(
+            monitor.subprocess, "run",
+            lambda args, **kw: self.Result(stdout=json.dumps({"unrelated": "shape"})),
+        )
+        healthy, reason = monitor.check_mcp_tools_live()
+        assert healthy is False
+        assert "unexpected payload" in reason
+
+
 class TestGitSyncCheck:
     """Test the local-main-vs-origin/main drift check.
 
