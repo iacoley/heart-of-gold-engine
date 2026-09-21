@@ -66,9 +66,9 @@ def build_digest_email(bucket: DigestBucket, source_label: str,
     lines = [
         f"SF apartment digest — {run_date.isoformat()}",
         f"Source: {source_label}",
-        "Criteria: <=$5,500/mo, >=750sqft, posted <30d "
-        "(7-30d flagged), Mission/Dogpatch/Potrero/SoMa/South "
-        "Beach/Mission Bay/Glen Park preferred, 1BR ideal but "
+        "Criteria: <=$5,500/mo, >=800sqft, posted <30d "
+        "(7-30d flagged), Hayes Valley/NoPa primary + Mission fallback "
+        "(Dogpatch/Potrero/SoMa/etc lower priority), 1BR ideal but "
         "building type flexible.",
         "",
     ]

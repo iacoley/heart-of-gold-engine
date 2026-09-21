@@ -58,19 +58,28 @@ class Listing:
     neighborhood: Optional[str]
 
 
-_TITLE_MARKER = re.compile(r'-\s*generic "([^"]+)" \[ref=e\d+\]:')
+# ref= tokens carry an opaque prefix that changes per browser
+# session/frame (observed live 2026-09-21: "e1" on one capture, "f2e1" on
+# a later one in the same session — Playwright doesn't guarantee "e" as
+# the leading character, only that it's some non-bracket token). Matching
+# the literal value was always fragile per this module's own docstring;
+# match any non-bracket token instead of assuming an "e\d+" shape.
+_REF = r'\[ref=[^\]]+\]'
+_TITLE_MARKER = re.compile(r'-\s*generic "([^"]+)" ' + _REF + r':')
 _URL = re.compile(r'/url:\s*(\S+)')
-_PRICE = re.compile(r'-\s*generic \[ref=e\d+\]:\s*(\$[\d,]+)\s*$', re.MULTILINE)
+_PRICE = re.compile(r'-\s*generic ' + _REF + r':\s*(\$[\d,]+)\s*$', re.MULTILINE)
 _SQFT_WITH_BEDS = re.compile(
-    r'text:\s*(\S+)\s*\n\s*-\s*generic \[ref=e\d+\]:\s*(\d+)ft2'
+    r'text:\s*(\S+)\s*\n\s*-\s*generic ' + _REF + r':\s*(\d+)ft2'
 )
 _POSTED = re.compile(
-    r'-\s*generic \[ref=e\d+\]:\s*((?:\d{1,2}/\d{1,2})|(?:\d+\s*\w*\s*ago))\s*$',
+    r'-\s*generic ' + _REF + r':\s*((?:\d{1,2}/\d{1,2})|(?:\d+\s*\w*\s*ago))\s*$',
     re.MULTILINE,
 )
 # Neighborhood is the bullet-separated text after the beds/sqft field,
 # before the next bullet or end of that inline group — best-effort only.
-_NEIGHBORHOOD = re.compile(r'ft2\s*\n(?:.*\n)*?\s*-\s*generic \[ref=e\d+\]:\s*•\s*\n\s*-\s*generic \[ref=e\d+\]:\s*([^\n$]+?)\s*$', re.MULTILINE)
+_NEIGHBORHOOD = re.compile(
+    r'ft2\s*\n(?:.*\n)*?\s*-\s*generic ' + _REF + r':\s*•\s*\n\s*-\s*generic '
+    + _REF + r':\s*([^\n$]+?)\s*$', re.MULTILINE)
 
 
 def parse_snapshot(text: str) -> list[Listing]:

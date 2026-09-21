@@ -3,21 +3,26 @@
 scorer.py — turns parse_craigslist_snapshot.Listing objects into ranked,
 digest-ready candidates against Ian's standing SF apartment criteria.
 
-Criteria source: data/attachments/1544416431842787540/
-0-sf-apartment-search-handoff.md, specifically the 2026-09-02 budget/size
-update (binding, supersedes the original transit-first framing) and the
-staleness buckets Ian specified in that same thread:
+Criteria source: taskboard task-1788557410's own title, "current params
+as of 2026-09-04 21:29" — this postdates and overrides the 2026-09-02
+handoff doc (data/attachments/1544416431842787540/
+0-sf-apartment-search-handoff.md) on the two points where they now
+disagree (sqft floor, primary neighborhood). The doc still supplies
+everything the newer task params don't restate (furniture-fit caveat,
+staleness buckets, budget ceiling, which is unchanged):
   - rent ceiling: $5,500/month (hard)
-  - minimum size: 750 sqft (hard)
+  - minimum size: 800 sqft (hard) — corrected 2026-09-21; the first live
+    digest send used 750 from the older doc before this was caught
   - posted >=30 days ago: discard (hard)
   - posted 7-30 days ago: include but flag as stale
   - posted <7 days ago: include, no flag
-  - preferred neighborhoods (walkable, transit-adjacent, matches the
-    day-to-day-livability pivot): Mission, Dogpatch, Potrero Hill, SoMa,
-    South Beach, Mission Bay, Glen Park
+  - primary neighborhoods: Hayes Valley, NoPa. Fallback (not cut):
+    Mission. Everything else (Dogpatch, Potrero Hill, SoMa, South Beach,
+    Mission Bay, Glen Park) is the older doc's explore, kept as a lower
+    third tier rather than dropped
   - 1BR ideal but not required — the loft/larger-2BR direction was
-    explicitly reopened once the $5,500/750sqft numbers were set, so beds
-    is a soft signal, not a filter
+    explicitly reopened once the $5,500/sqft-floor numbers were set, so
+    beds is a soft signal, not a filter
   - sofa footprint (Room & Board André, ~8.5ft wall run + 6ft chaise) and
     Cal King bed are real fit constraints but not extractable from a
     Craigslist card — surfaced as a standing caveat in the digest, not
@@ -46,7 +51,14 @@ from typing import Optional
 from parse_craigslist_snapshot import Listing
 
 RENT_CEILING = 5500
-SQFT_FLOOR = 750
+# 800, not 750: taskboard task-1788557410's own title carries "current
+# params as of 2026-09-04 21:29", which postdates and supersedes the
+# 750sqft figure in the 2026-09-02 handoff doc addendum this module was
+# first written against. Caught 2026-09-21 after the first live send
+# already went out built on the stale 750/Dogpatch reading — see memory
+# fact apartment-digest-scorer-and-first-live-send-2026-09-21 for the
+# correction, not just this comment.
+SQFT_FLOOR = 800
 DISCARD_AGE_DAYS = 30
 FLAG_AGE_DAYS = 7
 
@@ -60,9 +72,17 @@ FLAG_AGE_DAYS = 7
 # points; flagged loud instead so Ian sees the warning before the price.
 SUSPICIOUS_PRICE_PER_SQFT = 3.0
 
-PREFERRED_NEIGHBORHOODS = [
-    "mission", "dogpatch", "potrero", "soma", "south beach",
-    "mission bay", "glen park",
+# Primary per current taskboard params (2026-09-04): Hayes Valley/NoPa.
+# Mission is explicit fallback ("not cut"), weighted lower than primary
+# below. Dogpatch/Potrero/SoMa/etc. came from the earlier 09-02 handoff
+# doc explore and are kept as a third tier rather than dropped outright —
+# that doc was never formally retracted, only superseded on the specific
+# points (sqft floor, primary-neighborhood ranking) the newer task params
+# actually override.
+PRIMARY_NEIGHBORHOODS = ["hayes valley", "nopa", "north panhandle"]
+FALLBACK_NEIGHBORHOODS = ["mission"]
+OTHER_NEIGHBORHOODS = [
+    "dogpatch", "potrero", "soma", "south beach", "mission bay", "glen park",
 ]
 
 _RELATIVE_AGO = re.compile(r"^\s*(\d+)\s*([a-zA-Z]+)\s*ago\s*$")
@@ -121,9 +141,19 @@ def _price_to_int(price: Optional[str]) -> Optional[int]:
     return int(digits) if digits else None
 
 
-def _neighborhood_match(listing: Listing) -> bool:
+def _neighborhood_tier(listing: Listing) -> str:
+    """Returns 'primary', 'fallback', 'other', or 'unknown' (no
+    neighborhood signal at all in either the parsed field or the title —
+    common, since parse_craigslist_snapshot's neighborhood field is
+    best-effort only)."""
     haystack = f"{listing.neighborhood or ''} {listing.title}".lower()
-    return any(n in haystack for n in PREFERRED_NEIGHBORHOODS)
+    if any(n in haystack for n in PRIMARY_NEIGHBORHOODS):
+        return "primary"
+    if any(n in haystack for n in FALLBACK_NEIGHBORHOODS):
+        return "fallback"
+    if any(n in haystack for n in OTHER_NEIGHBORHOODS):
+        return "other"
+    return "unknown"
 
 
 def score_listing(listing: Listing, reference_date: date) -> ScoredListing:
@@ -174,7 +204,14 @@ def score_listing(listing: Listing, reference_date: date) -> ScoredListing:
         # budget points alone — cap it back down to a neutral value.
         budget_pts = min(budget_pts, 10.0)
     size_pts = max(0.0, min(30.0, (listing.sqft - SQFT_FLOOR) / 450 * 30))
-    neighborhood_pts = 20.0 if _neighborhood_match(listing) else 10.0
+    neighborhood_tier = _neighborhood_tier(listing)
+    neighborhood_pts = {
+        "primary": 20.0, "fallback": 14.0, "other": 8.0, "unknown": 10.0,
+    }[neighborhood_tier]
+    if neighborhood_tier in ("other",):
+        flags.append(f"neighborhood ({listing.neighborhood or 'unclear'}) "
+                      "is outside current Hayes Valley/NoPa primary + "
+                      "Mission fallback — kept, lower priority")
     if age_days is None:
         recency_pts = 5.0
     elif age_days < FLAG_AGE_DAYS:
@@ -265,9 +302,13 @@ def _selftest() -> int:
     check("top picks are sorted descending by score",
           all(bucket.top_picks[i].score >= bucket.top_picks[i + 1].score
               for i in range(len(bucket.top_picks) - 1)))
-    check("the no-price 794ft2 listing lands in needs_check, not silently scored",
-          any(s.listing.title.startswith("Community Workspaces")
+    check("the no-price 1035ft2 'Rooftop Deck...' listing lands in "
+          "needs_check, not silently scored",
+          any(s.listing.title.startswith("Rooftop Deck")
               for s in bucket.needs_check))
+    check("the 794ft2 listings are correctly discarded under the 800 floor, "
+          "not routed to needs_check despite also missing price",
+          not any(s.listing.sqft == 794 for s in bucket.needs_check))
     check("no listing appears in both top_picks and needs_check",
           {id(s.listing) for s in bucket.top_picks}
           .isdisjoint({id(s.listing) for s in bucket.needs_check}))
