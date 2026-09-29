@@ -23,10 +23,27 @@ name: Require review
 # required status check under branch protection (or a repository ruleset) on
 # the default branch. That is a repo-admin setting and cannot be committed to
 # the repo. Without it, this job is advisory: visibly red, still mergeable.
+#
+# STALE-FAILURE BUG (2026-09-29): `opened`/`reopened`/`ready_for_review` all
+# fire on a commit SHA that, by definition, has zero reviews yet -- this job
+# is guaranteed to fail every single time on those triggers, for every PR,
+# forever. That failing check run doesn't go away when `pull_request_review`
+# later fires a second, passing run for the *same* SHA -- both check runs
+# persist against that commit, and branch protection's status rollup blocked
+# the merge on the presence of the old failure even with the new pass sitting
+# right next to it (confirmed live on PR #21 and #22, both stuck on
+# `mergeable_state: blocked` despite `reviewDecision: APPROVED` and every
+# other check green; required an admin-override merge to get past it).
+# Fix: drop the triggers that can never carry a real review yet. `synchronize`
+# stays because it fires on a fresh SHA (a new push), which can't collide
+# with a prior run the way same-SHA re-triggers do. `pull_request_review`
+# stays as the trigger that actually reflects a review happening. A PR that's
+# never pushed to after opening now gets exactly one run for its SHA, from
+# the review event -- no phantom failure left behind to block it.
 
 on:
   pull_request:
-    types: [opened, reopened, synchronize, ready_for_review]
+    types: [synchronize]
   pull_request_review:
     types: [submitted, dismissed]
 
