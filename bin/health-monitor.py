@@ -3,6 +3,7 @@
 Health Monitor — Checks component health and alerts on staleness
 """
 
+import importlib.util
 import json
 import logging
 import os
@@ -294,6 +295,38 @@ def check_git_sync() -> tuple[bool, str]:
         return False, "; ".join(problems)
     return True, ""
 
+def check_channel_names() -> tuple[bool, str]:
+    """Wraps bin/channel-name-check.py's check_channel_names(): keeps
+    config/channels.json's cached Discord display name fresh and flags it
+    when it drifts (2026-09-29: the channel this repo calls `agent-chat`
+    had been renamed `the-banana-stand` on Discord's side with nothing
+    here aware of it -- Ian had to say so twice before it stuck anywhere
+    durable). Loaded by file path, not plain import: the module's
+    filename has a hyphen (matches this file's own naming, and its
+    sibling scripts' e.g. discord-read.py), which isn't a valid module
+    name for `import`. Resolved relative to this file's own location
+    (bin/channel-name-check.py is a fixed sibling of bin/health-monitor.py
+    regardless of WORKSPACE_ROOT) rather than via WORKSPACE_ROOT, same
+    reasoning skills/outbox/scripts/queue_outbox_message.py's own
+    docstring gives for the same choice -- WORKSPACE_ROOT only controls
+    where the loaded module *writes data* once it's imported, same as
+    every other WORKSPACE_ROOT-reading script here. Failure to even load
+    it is reported like any other check failure rather than raising out
+    of main()."""
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "channel_name_check", Path(__file__).resolve().parent / "channel-name-check.py"
+        )
+        channel_name_check = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(channel_name_check)
+    except Exception as e:
+        return False, f"channel name check: could not load bin/channel-name-check.py: {e}"
+    try:
+        return channel_name_check.check_channel_names()
+    except Exception as e:
+        return False, f"channel name check: errored: {e}"
+
+
 def poke_signals(message: str):
     """Send alert to signals channel"""
     try:
@@ -331,6 +364,11 @@ def main():
     if not git_healthy:
         log.warning(f"Health check failed: {git_reason}")
         issues.append(git_reason)
+
+    names_healthy, names_reason = check_channel_names()
+    if not names_healthy:
+        log.warning(f"Health check failed: {names_reason}")
+        issues.append(names_reason)
 
     if issues:
         alert = "⚠️ Health check failures:\n" + "\n".join(f"• {issue}" for issue in issues)
