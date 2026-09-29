@@ -2105,6 +2105,72 @@ def load_onboarding_prompt(agent: str) -> str:
     return text.strip()
 
 
+# Security: the agent subprocess — and everything it spawns via Bash,
+# which is the entire point of the tool — must not inherit this
+# process's full environment. `{**os.environ}` handed GITHUB_TOKEN,
+# MAILGUN_API_KEY, GMAIL_APP_PASSWORD, AGENT_SERVER_TOKEN, and
+# DISCORD_BOT_TOKEN_PRIMARY to any Bash call the agent made, unfiltered.
+# Flagged 2026-09-29 (agent-chat security discussion w/ Zero and Amos,
+# prompted by the OpenAI/Services Australia writeup); Ian signed off
+# same day on the pattern the three of us converged on: prune to an
+# explicit allowlist, don't zero the env and don't blanket-copy-then-
+# strip. A strip-by-pattern blocklist is exactly the "polite fiction"
+# Zero called out — bypassable, and silently stale the day someone adds
+# a credential whose name doesn't end in _TOKEN/_KEY/_SECRET/_AUTH.
+#
+# Non-secret operational vars, carried through unchanged. None of these
+# are credentials, but several — WORKSPACE_ROOT chief among them — are
+# load-bearing for tools-server.py, admin-server.py, and every skill
+# script the subprocess's MCP servers spawn. Dropping them doesn't fail
+# loud, it silently falls back to a wrong default path.
+INERT_ENV_ALLOWLIST = (
+    # POSIX baseline
+    "PATH", "HOME", "USER", "SHELL", "TERM", "LANG", "LC_ALL", "TMPDIR",
+    "PAGER", "LESS", "XDG_CONFIG_HOME",
+    # Karakos operational config
+    "WORKSPACE_ROOT", "KARAKOS_LOG_DIR", "AGENT_SERVER_PORT",
+    "AGENT_SERVER_URL", "AGENT_BRIDGE_HOST", "OWNER_DISCORD_ID",
+    "OWNER_NAME", "SYSTEM_NAME", "KARAKOS_DISCORD_API_BASE",
+    "COST_DAILY_LIMIT", "COST_MONTHLY_LIMIT", "COST_WARNING_THRESHOLD",
+    "MEMORY_CUTOFF", "MEMORY_DECAY_RATE", "MEMORY_MAX_EPISODES",
+    "MEMORY_PRUNE_GRACE_DAYS", "MEMORY_SCORE_RETRY_TIMEOUT",
+    "MEMORY_SCORE_TIMEOUT", "MESSAGE_RETENTION_DAYS",
+    "PATTERNS_DEPRECATE_DAYS", "PATTERNS_LOOKBACK_DAYS",
+    "PATTERNS_SIMILARITY_THRESHOLD", "DEDUP_MERGE_THRESHOLD",
+    "TOOL_AUDIT_RETENTION_DAYS", "MAX_ATTACHMENTS_PER_MESSAGE",
+    "MAX_ATTACHMENT_BYTES", "MAX_CONCURRENT_BUILDERS",
+    "MAX_CONCURRENT_REVIEWERS", "RESTART_SERVER_IDLE_WAIT_TIMEOUT_SEC",
+    "STATUS_POLL_INTERVAL_SEC", "AUTH_GUARD_RELOGIN_CHANNEL",
+    "RECOVERY_DRY_RUN", "RECOVERY_MAX_ACTIONS_PER_HOUR",
+    "RECOVERY_SWEEP_INTERVAL_SEC", "RECOVERY_WEDGED_TIMEOUT_SEC",
+)
+
+# The only credentials the subprocess actually needs, injected by name
+# rather than inherited wholesale. Extend this only when a new call
+# site turns up a real dependency — never widen it back to "everything":
+#   AGENT_SERVER_TOKEN        karakos-admin MCP (mcp/admin-server.py)
+#                              and `bin/kara` both authenticate to
+#                              agent-server's own HTTP API with it.
+#   DISCORD_BOT_TOKEN_PRIMARY  the `discord` tool (mcp/tools-server.py)
+#                              reads it straight off subprocess env.
+SCOPED_SECRET_ALLOWLIST = (
+    "AGENT_SERVER_TOKEN",
+    "DISCORD_BOT_TOKEN_PRIMARY",
+)
+
+
+def build_subprocess_env(agent: str) -> dict:
+    """Pruned env for the agent subprocess: the allowlists above, plus
+    AGENT_NAME — never a blanket copy of this process's environment."""
+    env = {
+        key: os.environ[key]
+        for key in (*INERT_ENV_ALLOWLIST, *SCOPED_SECRET_ALLOWLIST)
+        if key in os.environ
+    }
+    env["AGENT_NAME"] = agent
+    return env
+
+
 async def start_agent_subprocess(agent: str):
     """Start persistent Claude subprocess for agent"""
     config = agent_config.get(agent, {})
@@ -2202,7 +2268,10 @@ async def start_agent_subprocess(agent: str):
     # `session` tool's finalize action needs an agent name to pass to
     # summarize-session.py and otherwise has no way to know it wasn't
     # relay that called it.
-    subprocess_env = {**os.environ, "AGENT_NAME": agent}
+    #
+    # Pruned, not a blanket copy — see build_subprocess_env() and the
+    # allowlists above it for why.
+    subprocess_env = build_subprocess_env(agent)
 
     try:
         proc = await asyncio.create_subprocess_exec(
