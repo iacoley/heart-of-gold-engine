@@ -130,3 +130,119 @@ def test_multiple_rows_only_undelivered_are_flushed(outbox, monkeypatch):
     outbox.flush_pending()
 
     assert calls == ["general", "signals"]
+
+
+# PASS-sentinel guard (2026-09-28 incident): flush_pending() is a second,
+# independent send path from agent-server.py's post_to_discord() — a
+# backed-up outbox queue flushed ~50 literal/near-literal "PASS" messages
+# to Discord with no screening at all. These tests exercise the guard
+# added at the top of the flush loop, before discord-notify.sh is ever
+# invoked.
+
+def test_flush_pending_drops_exact_pass(outbox, monkeypatch):
+    calls = []
+
+    def fake_run(cmd, check, capture_output, text):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="Posted", stderr="")
+
+    monkeypatch.setattr(outbox.subprocess, "run", fake_run)
+
+    outbox.add_pending("general", "PASS")
+    delivered = outbox.flush_pending()
+
+    assert calls == []  # discord-notify.sh never invoked
+    assert delivered == []  # not counted as a real delivery
+    rows = outbox._load_rows()
+    assert rows[0]["delivered_at"] is not None  # but marked done, not retried
+    assert rows[0]["dropped"] is True
+    assert rows[0]["drop_reason"] == "pass_sentinel"
+
+
+def test_flush_pending_drops_pass_with_punctuation(outbox, monkeypatch):
+    monkeypatch.setattr(
+        outbox.subprocess, "run",
+        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout="Posted", stderr=""),
+    )
+    outbox.add_pending("general", "PASS.")
+    outbox.flush_pending()
+    assert outbox._load_rows()[0]["dropped"] is True
+
+
+def test_flush_pending_drops_real_incident_variants(outbox, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        outbox.subprocess, "run",
+        lambda cmd, check, capture_output, text: (calls.append(cmd) or
+            subprocess.CompletedProcess(cmd, 0, stdout="Posted", stderr="")),
+    )
+    variants = [
+        "Same as last round — nothing's changed, nothing needs saying again.\n\nPASS",
+        "Already flagged and resolved with Zero last round. Nothing new here.PASS",
+        "Healthy, inbox empty, nothing new since the last check. PASS",
+    ]
+    for text in variants:
+        outbox.add_pending("general", text)
+    outbox.flush_pending()
+
+    assert calls == []
+    rows = outbox._load_rows()
+    assert all(r["dropped"] for r in rows)
+
+
+def test_flush_pending_does_not_drop_lowercase_or_partial_pass_words(outbox, monkeypatch):
+    calls = []
+
+    def fake_run(cmd, check, capture_output, text):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="Posted", stderr="")
+
+    monkeypatch.setattr(outbox.subprocess, "run", fake_run)
+
+    outbox.add_pending("general", "PASSWORD reset needed for the dashboard login.")
+    outbox.add_pending("general", "Already passed the test suite, ready to merge.")
+    outbox.add_pending("general", "Traffic can bypass the cache on this route.")
+    delivered = outbox.flush_pending()
+
+    assert len(delivered) == 3
+    assert len(calls) == 3
+    rows = outbox._load_rows()
+    assert not any(r.get("dropped") for r in rows)
+
+
+def test_flush_pending_does_not_drop_pass_mid_sentence(outbox, monkeypatch):
+    monkeypatch.setattr(
+        outbox.subprocess, "run",
+        lambda cmd, check, capture_output, text: subprocess.CompletedProcess(cmd, 0, stdout="Posted", stderr=""),
+    )
+    outbox.add_pending(
+        "general",
+        "The gate said PASS but then kept going with more detail after that.",
+    )
+    delivered = outbox.flush_pending()
+    assert len(delivered) == 1
+    assert outbox._load_rows()[0].get("dropped") is not True
+
+
+def test_flush_pending_evaluates_whole_reply_before_chunking(outbox, monkeypatch):
+    """A message long enough to be split into multiple 2000-char chunks
+    must still be caught by the PASS guard, evaluated against the whole
+    unchunked reply, not per-chunk."""
+    calls = []
+
+    def fake_run(cmd, check, capture_output, text):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="Posted", stderr="")
+
+    monkeypatch.setattr(outbox.subprocess, "run", fake_run)
+
+    long_prose = ("Nothing new since last check. " * 100).strip()
+    content = f"{long_prose}\n\nPASS"
+    assert len(content) > outbox.MAX_DISCORD_MSG_LEN
+
+    outbox.add_pending("general", content)
+    delivered = outbox.flush_pending()
+
+    assert calls == []
+    assert delivered == []
+    assert outbox._load_rows()[0]["dropped"] is True
