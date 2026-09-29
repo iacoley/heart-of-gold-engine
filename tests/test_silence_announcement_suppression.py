@@ -16,26 +16,38 @@ heavy work at import time (event loop, sqlite, subprocess setup).
 """
 
 import re
+import sys
 from pathlib import Path
 
 from conftest import PACKAGE_ROOT
 
 AGENT_SERVER = PACKAGE_ROOT / "bin" / "agent-server.py"
 
+# is_silence_announcement() now delegates its PASS check to
+# bin/pass_filter.py's is_pass_sentinel() (shared with bin/outbox.py's
+# flush_pending() — see that module's docstring for why one shared
+# definition replaced the two independent regexes this test used to
+# extract, PASS_SENTINEL_RE here and outbox's own copy). Make it
+# importable for exec() below the same way conftest.import_script() makes
+# bin/ scripts importable.
+bin_dir = str(PACKAGE_ROOT / "bin")
+if bin_dir not in sys.path:
+    sys.path.insert(0, bin_dir)
+from pass_filter import is_pass_sentinel  # noqa: E402
+
 
 def load_is_silence_announcement():
-    """Pull PASS_SENTINEL_RE, SILENCE_ANNOUNCEMENT_RE, and
-    is_silence_announcement() out of agent-server.py without booting it."""
+    """Pull SILENCE_ANNOUNCEMENT_RE and is_silence_announcement() out of
+    agent-server.py without booting it."""
     src = AGENT_SERVER.read_text()
-    start = src.index("PASS_SENTINEL_RE = re.compile")
-    end = src.index("\ndef main(", start) if "\ndef main(" in src[start:] else None
+    start = src.index("SILENCE_ANNOUNCEMENT_RE = re.compile")
     # Slice up to (not including) the next top-level def/class after the
     # function body — same boundary-finding approach test_discord_split.py
     # uses, just anchored on our own block's known end marker instead.
-    func_end_marker = "return bool(PASS_SENTINEL_RE.search(stripped) or SILENCE_ANNOUNCEMENT_RE.match(stripped))"
+    func_end_marker = "return bool(is_pass_sentinel(stripped) or SILENCE_ANNOUNCEMENT_RE.match(stripped))"
     end_idx = src.index(func_end_marker, start) + len(func_end_marker)
     body = src[start:end_idx]
-    ns = {"re": re}
+    ns = {"re": re, "is_pass_sentinel": is_pass_sentinel}
     exec(compile(body, str(AGENT_SERVER), "exec"), ns)
     return ns["is_silence_announcement"]
 

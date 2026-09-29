@@ -39,6 +39,7 @@ stderr) rather than a silent text-only fallback.
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -48,6 +49,9 @@ from pathlib import Path
 
 import context_box
 from handoff import parse_handoff
+from pass_filter import is_pass_sentinel
+
+log = logging.getLogger("outbox")
 
 WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
 OUTBOX_PATH = WORKSPACE_ROOT / "data" / "outbox" / "pending.jsonl"
@@ -189,6 +193,28 @@ def flush_pending() -> list[str]:
     for row in rows:
         if row.get("delivered_at"):
             continue
+
+        # PASS-sentinel guard (2026-09-28 incident: a backed-up queue
+        # flushed ~50 literal/near-literal "PASS" posts to Discord once
+        # posting permission was restored). This is the actual send
+        # chokepoint for the outbox path — checked against the row's full,
+        # unchunked content, before _split_discord_message ever runs, so
+        # chunking can't change the verdict. A match is dropped, not
+        # retried: mark delivered_at now (with dropped=True for the
+        # audit trail flush_pending's own docstring promises) so a PASS
+        # row doesn't sit in pending.jsonl forever re-triggering this
+        # check every flush. See pass_filter.py for the exact rule.
+        if is_pass_sentinel(row["content"] or ""):
+            log.info(
+                "outbox: dropping PASS-sentinel row %s -> #%s: %r",
+                row["id"], row["channel"], (row["content"] or "")[:200],
+            )
+            row["delivered_at"] = datetime.now(timezone.utc).isoformat()
+            row["dropped"] = True
+            row["drop_reason"] = "pass_sentinel"
+            changed = True
+            continue
+
         try:
             chunks = _split_discord_message(row["content"] or "")
             if not chunks:

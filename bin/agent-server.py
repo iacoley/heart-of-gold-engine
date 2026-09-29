@@ -36,6 +36,7 @@ import voice_presence
 import auth_guard
 from handoff import parse_handoff
 from outbox import add_pending
+from pass_filter import is_pass_sentinel
 
 # =============================================================================
 # Configuration
@@ -317,11 +318,16 @@ THINKING_BLOCK_RE = re.compile(r"<thinking>(.*?)</thinking>", re.DOTALL)
 # "this turn's answer IS silence, not a message about silence."
 #
 # Two layers, cheapest first:
-#   1. PASS_SENTINEL_RE — an explicit, forward-looking convention (matches
-#      Amos's own side's identical fix, same day): a reply that opens or
-#      closes with a bare, all-caps PASS is suppressed outright. Requires
-#      the model to actually say PASS, which is a prompt-level change this
-#      PR does not make — the check is here so that once it does, it works.
+#   1. is_pass_sentinel() (bin/pass_filter.py) — an explicit, forward-looking
+#      convention (matches Amos's own side's identical fix, same day): a
+#      reply that opens or closes with a bare, all-caps PASS (optionally
+#      wrapped in markdown emphasis) is suppressed outright. Requires the
+#      model to actually say PASS, which is a prompt-level change this PR
+#      does not make — the check is here so that once it does, it works.
+#      Shared with bin/outbox.py's flush_pending(), the *other* independent
+#      send path (the durable cross-channel queue) — see pass_filter.py's
+#      module docstring for the 2026-09-28 incident that made a shared,
+#      single definition necessary instead of two regexes that could drift.
 #   2. SILENCE_ANNOUNCEMENT_RE — a heuristic net for the CURRENT phrasing,
 #      built directly from the 12 real examples above, not a general
 #      sentiment classifier. Three shapes only, each deliberately narrow
@@ -346,7 +352,6 @@ THINKING_BLOCK_RE = re.compile(r"<thinking>(.*?)</thinking>", re.DOTALL)
 #      This is a stopgap net for existing behavior, not a substitute for
 #      #1 — expect to delete this once the model reliably emits PASS
 #      instead.
-PASS_SENTINEL_RE = re.compile(r"(^PASS\b|\bPASS[.!?]*$)")
 SILENCE_ANNOUNCEMENT_RE = re.compile(
     r"^\*?[(\[].*[)\]]\*?$"                                        # (a) whole message is a parenthetical or bracketed aside
     r"|^(Not (my mention|mine to take|addressed to me)"           # (b) unambiguous leading phrases
@@ -359,11 +364,11 @@ SILENCE_ANNOUNCEMENT_RE = re.compile(
 
 def is_silence_announcement(text: str) -> bool:
     """True if `text` is a turn explaining that it decided not to reply,
-    rather than an actual reply. See the comment above PASS_SENTINEL_RE."""
+    rather than an actual reply. See the comment above is_pass_sentinel()."""
     stripped = (text or "").strip()
     if not stripped:
         return False
-    return bool(PASS_SENTINEL_RE.search(stripped) or SILENCE_ANNOUNCEMENT_RE.match(stripped))
+    return bool(is_pass_sentinel(stripped) or SILENCE_ANNOUNCEMENT_RE.match(stripped))
 
 # Singleton-instance guard (2026-08-07) — see the matching guard in
 # relay.py / scheduler.py for the full incident writeup
@@ -3781,7 +3786,7 @@ async def process_agent_queue(agent: str):
                 # to answer" is a decision, and posting that decision is exactly
                 # the failure mode reply_gate.py's docstring already warns
                 # against ("Silence should be the normal state between two
-                # agents"). See the comment above PASS_SENTINEL_RE.
+                # agents"). See the comment above is_pass_sentinel().
                 if pending_final and channel_id != "0" and not is_silence_announcement(pending_final):
                     # Visible claim marker (2026-09-07, same Zero finding):
                     # held_post_banana means this turn holds the API-side
