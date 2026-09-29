@@ -500,3 +500,50 @@ class TestCiStatusAfterPush:
         healthy, reason = monitor.check_git_sync()
         assert healthy is True
         assert reason == ""
+
+
+class TestChannelNamesCheck:
+    """check_channel_names() wraps bin/channel-name-check.py: keeps
+    config/channels.json's cached Discord display name fresh and flags
+    drift. Loaded here by file path (not WORKSPACE_ROOT), matching what
+    the function itself does, so these tests exercise the real sibling
+    script rather than a stand-in."""
+
+    def _make_monitor(self, tmp_workspace, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_workspace))
+        return import_script("health-monitor")
+
+    def test_healthy_when_no_channels_configured(self, tmp_workspace, monkeypatch):
+        monitor = self._make_monitor(tmp_workspace, monkeypatch)
+        (tmp_workspace / "config").mkdir(parents=True, exist_ok=True)
+        (tmp_workspace / "config" / "channels.json").write_text('{"channels": {}}')
+        (tmp_workspace / "config" / "agents.json").write_text('{"agents": {}}')
+
+        healthy, reason = monitor.check_channel_names()
+        assert healthy is True
+        assert reason == ""
+
+    def test_loads_real_sibling_module_without_a_token(self, tmp_workspace, monkeypatch):
+        """End-to-end through the real bin/channel-name-check.py via its
+        actual load-by-file-path mechanism -- this is the wiring test,
+        not the drift-detection logic test (that's
+        test_channel_name_check.py, with fetch_channel_name monkeypatched
+        there). No agents.json here means load_bot_token() deterministically
+        returns None, so this exercises the real load path with zero
+        network calls instead of depending on one succeeding or failing
+        in whatever sandbox runs this suite."""
+        monitor = self._make_monitor(tmp_workspace, monkeypatch)
+        (tmp_workspace / "config").mkdir(parents=True, exist_ok=True)
+        (tmp_workspace / "config" / "channels.json").write_text(json.dumps({
+            "channels": {
+                "agent-chat": {"id": "111", "guild_id": "999", "discord_name": "agent-chat"},
+            }
+        }))
+        # No config/agents.json written: load_bot_token() catches the
+        # read failure and returns None, same as a real host with no
+        # Discord token configured.
+
+        healthy, reason = monitor.check_channel_names()
+
+        assert healthy is True
+        assert reason == ""
