@@ -61,13 +61,13 @@ CORE_TOOLS = [
     },
     {
         "name": "memory",
-        "description": "Query episodic memory. Actions: recall (search episodes), facts (search facts), recent (recent episodes).",
+        "description": "Query and write memory. Actions: recall (search episodes), facts (search facts), recent (recent episodes), remember (write one fact to the facts table).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["recall", "facts", "recent"],
+                    "enum": ["recall", "facts", "recent", "remember"],
                     "description": "The action to perform"
                 },
                 "query": {
@@ -77,6 +77,22 @@ CORE_TOOLS = [
                 "limit": {
                     "type": "integer",
                     "description": "Max results (default: 10)"
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "Who/what the fact is about (required for remember)"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The fact itself (required for remember, must be non-empty)"
+                },
+                "confidence": {
+                    "type": "number",
+                    "description": "0-1 confidence in the fact (remember only, default 0.8)"
+                },
+                "domain": {
+                    "type": "string",
+                    "description": "Category for the fact (remember only, default 'general')"
                 }
             },
             "required": ["action"]
@@ -407,8 +423,12 @@ def handle_core_tool(tool_name: str, args: dict) -> dict:
     elif tool_name == "memory":
         action = args.get("action", "recent")
         memory_db = WORKSPACE / "data" / "memory" / "memory.db"
-        if not memory_db.exists():
+        # `remember` is a write and must work on a fresh install that hasn't
+        # seen the 3 AM maintenance pass yet — every other action is a read
+        # and stays an error against a DB that was never created.
+        if not memory_db.exists() and action != "remember":
             return {"error": "Memory database not found"}
+        memory_db.parent.mkdir(parents=True, exist_ok=True)
 
         conn = sqlite3.connect(str(memory_db))
         conn.row_factory = sqlite3.Row
@@ -438,6 +458,60 @@ def handle_core_tool(tool_name: str, args: dict) -> dict:
                 (f"%{query}%", f"%{query}%", limit)
             ).fetchall()
             return {"facts": [dict(r) for r in rows]}
+
+        elif action == "remember":
+            # The only production write path into `facts`. Before this,
+            # `git grep -n "INSERT INTO facts"` turned up nothing outside
+            # test fixtures — the table existed but nothing ever wrote to
+            # it, so a fact an agent learned mid-conversation had nowhere
+            # durable to go.
+            subject = (args.get("subject") or "").strip()
+            content = (args.get("content") or "").strip()
+            if not subject:
+                return {"error": "remember requires a non-empty 'subject'"}
+            if not content:
+                return {"error": "remember requires non-empty 'content'"}
+
+            confidence = args.get("confidence", 0.8)
+            try:
+                confidence = float(confidence)
+            except (TypeError, ValueError):
+                return {"error": "'confidence' must be a number"}
+            confidence = max(0.0, min(1.0, confidence))
+
+            domain = (args.get("domain") or "general").strip() or "general"
+
+            # Guarded create: a memory.db from before facts existed
+            # (or a fresh one this call is the first write to) still
+            # gets a table with the exact schema bin/memory-maintenance.py
+            # creates, rather than an OperationalError on first remember.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS facts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    subject TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    confidence REAL DEFAULT 0.8,
+                    domain TEXT DEFAULT 'general',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP
+                )
+            """)
+
+            cursor = conn.execute(
+                "INSERT INTO facts (subject, content, confidence, domain, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (subject, content, confidence, domain,
+                 datetime.now(timezone.utc).isoformat())
+            )
+            conn.commit()
+            return {
+                "status": "ok",
+                "id": cursor.lastrowid,
+                "subject": subject,
+                "content": content,
+                "confidence": confidence,
+                "domain": domain,
+            }
 
         conn.close()
 

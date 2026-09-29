@@ -31,6 +31,13 @@ HEALTH_FILE = WORKSPACE / "data" / "health" / "memory-maintenance.json"
 DECAY_RATE = float(os.environ.get("MEMORY_DECAY_RATE", "0.25"))
 IMPORTANCE_CUTOFF = float(os.environ.get("MEMORY_CUTOFF", "6.0"))
 MAX_EPISODES = int(os.environ.get("MEMORY_MAX_EPISODES", "15"))
+# Episodes younger than this are never pruned, regardless of score — the
+# scoring pass and the prune pass used to run back to back in the same
+# main() invocation, so a freshly created episode scored in the 5-6 range
+# (which is where the Haiku scoring prompt rates ordinary interactions) was
+# deleted the same night it was written. Measured 2026-09-28: 96 episodes
+# created, 93 pruned in the same run, net 3 kept.
+MEMORY_PRUNE_GRACE_DAYS = float(os.environ.get("MEMORY_PRUNE_GRACE_DAYS", "7"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,10 +58,12 @@ def init_db() -> sqlite3.Connection:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             summary TEXT NOT NULL,
             importance REAL DEFAULT 5.0,
+            base_importance REAL,
             channel TEXT,
             tags TEXT,
             agents TEXT,
             created_at TIMESTAMP,
+            inserted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             consolidated_at TIMESTAMP DEFAULT NULL,
             embedding BLOB
         );
@@ -86,8 +95,57 @@ def init_db() -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_facts_domain ON facts(domain);
     """)
 
+    _migrate_episode_columns(conn)
+
     conn.commit()
     return conn
+
+
+def _migrate_episode_columns(conn: sqlite3.Connection) -> None:
+    """Guarded migration: add `base_importance` and `inserted_at` to
+    `episodes` on a database created before either existed, and backfill
+    any row missing a value for either — unconditionally, every call, not
+    only right after the `ALTER TABLE` — so a row written some other way
+    (or one that predates a column added by an even older version of this
+    migration) never sits with a NULL that would otherwise make it either
+    un-prunable forever (`inserted_at`) or double-decay (`base_importance`
+    falling back to the already-decayed `importance`).
+
+    `base_importance` is the score `decay_importance()` subtracts age
+    from — without it, decay was applied to the already-decayed
+    `importance` column every night, so loss compounded quadratically
+    instead of growing linearly with age. Backfilled from the current
+    `importance` so existing rows don't jump on the next run; this does
+    mean a pre-existing row's already-decayed value becomes its new
+    `base_importance`, i.e. one extra round of decay gets baked in at
+    migration time, and then ages normally from there.
+
+    `inserted_at` records when the row was written to the DB, as opposed
+    to `created_at` (the source message's own timestamp, still used for
+    recall ranking). It is what the prune grace period measures against,
+    so a backfilled default of "now" is deliberately conservative: it
+    protects pre-existing rows for a full grace period rather than
+    silently making them immediately prunable.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(episodes)").fetchall()}
+
+    if "base_importance" not in cols:
+        conn.execute("ALTER TABLE episodes ADD COLUMN base_importance REAL")
+
+    if "inserted_at" not in cols:
+        # No DEFAULT clause here: SQLite refuses ADD COLUMN with a
+        # non-constant default (CURRENT_TIMESTAMP) on a table that already
+        # has rows ("Cannot add a column with non-constant default"). The
+        # fresh-DB CREATE TABLE above still carries the real column default;
+        # this bare ALTER only runs against a pre-existing table.
+        conn.execute("ALTER TABLE episodes ADD COLUMN inserted_at TIMESTAMP")
+
+    conn.execute(
+        "UPDATE episodes SET base_importance = importance WHERE base_importance IS NULL"
+    )
+    conn.execute(
+        "UPDATE episodes SET inserted_at = CURRENT_TIMESTAMP WHERE inserted_at IS NULL"
+    )
 
 
 def read_previous_day_messages() -> list:
@@ -113,8 +171,39 @@ def read_previous_day_messages() -> list:
     return messages
 
 
-def score_importance(summary: str) -> float:
-    """Score episode importance using Claude Haiku (cheap)."""
+SCORE_TIMEOUT_FIRST = float(os.environ.get("MEMORY_SCORE_TIMEOUT", "20"))
+SCORE_TIMEOUT_RETRY = float(os.environ.get("MEMORY_SCORE_RETRY_TIMEOUT", "60"))
+# On a final scoring failure the episode is kept rather than defaulted to a
+# below-cutoff score — 5.0 used to sit under the 6.0 cutoff, so a Haiku
+# hiccup silently pruned the episode that same night regardless of its
+# actual importance.
+SCORE_FAILURE_IMPORTANCE = IMPORTANCE_CUTOFF + 1.0
+
+
+def _score_importance_once(prompt: str, timeout: float) -> float | None:
+    try:
+        result = subprocess.run(
+            ["claude", "-p", prompt, "--model", "haiku", "--max-turns", "1"],
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+        score_str = result.stdout.strip()
+        score = float(score_str)
+        return max(1.0, min(10.0, score))
+    except Exception:
+        return None
+
+
+def score_importance(summary: str, stats: dict | None = None) -> float:
+    """Score episode importance using Claude Haiku (cheap).
+
+    Retries once with a longer timeout before giving up. A final failure
+    returns a score at/above the cutoff (never a value that would make the
+    episode immediately prunable) and, when `stats` is passed, increments
+    `stats["score_failures"]` so a run of persistent scoring failures shows
+    up in the health file instead of silently degrading recall quality.
+    """
     prompt = f"""Score the importance of this conversation excerpt on a scale of 1-10.
 
 Consider:
@@ -128,19 +217,22 @@ Excerpt: {summary}
 
 Respond with ONLY a number 1-10."""
 
-    try:
-        result = subprocess.run(
-            ["claude", "-p", prompt, "--model", "haiku", "--max-turns", "1"],
-            capture_output=True,
-            text=True,
-            timeout=20
-        )
-        score_str = result.stdout.strip()
-        score = float(score_str)
-        return max(1.0, min(10.0, score))
-    except Exception as e:
-        log.warning(f"Failed to score importance: {e}, defaulting to 5.0")
-        return 5.0
+    score = _score_importance_once(prompt, SCORE_TIMEOUT_FIRST)
+    if score is not None:
+        return score
+
+    log.warning("Failed to score importance on first attempt, retrying with longer timeout")
+    score = _score_importance_once(prompt, SCORE_TIMEOUT_RETRY)
+    if score is not None:
+        return score
+
+    log.warning(
+        f"Failed to score importance after retry, defaulting to "
+        f"{SCORE_FAILURE_IMPORTANCE} (cutoff-safe, not discarded)"
+    )
+    if stats is not None:
+        stats["score_failures"] = stats.get("score_failures", 0) + 1
+    return SCORE_FAILURE_IMPORTANCE
 
 
 def segment_messages_into_episodes(messages: list) -> list:
@@ -189,12 +281,21 @@ def create_episode_summary(messages: list) -> str:
 def decay_importance(conn: sqlite3.Connection) -> int:
     """Apply time-based decay to episode importance scores.
 
-    Decay formula: effective_score = importance - (days_since_creation * DECAY_RATE / 4)
+    Decay formula: importance = base_importance - (days_since_creation * DECAY_RATE / 4)
     Default DECAY_RATE=0.25 means 0.25 points lost per 4 days.
+
+    Computed from `base_importance` (the score at creation, never modified
+    after `_migrate_episode_columns()` backfills or an insert sets it) rather
+    than the current `importance` column. The old version subtracted the
+    day's decay from whatever `importance` already was, so a run every night
+    compounded the loss quadratically with age instead of linearly. Keying
+    off `base_importance` every time makes this idempotent: running it twice
+    in a row, or nightly for a year, converges on the same value for a given
+    age rather than drifting further each time.
     """
     # Calculate decay for each episode based on age
     rows = conn.execute(
-        "SELECT id, importance, created_at FROM episodes WHERE importance > ?"
+        "SELECT id, base_importance, importance, created_at FROM episodes WHERE importance > ?"
         , (IMPORTANCE_CUTOFF,)
     ).fetchall()
 
@@ -203,10 +304,13 @@ def decay_importance(conn: sqlite3.Connection) -> int:
 
     for row in rows:
         try:
+            base = row["base_importance"]
+            if base is None:
+                base = row["importance"]
             created_at = datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
             days_old = (now - created_at).total_seconds() / 86400
             decay_amount = (days_old / 4.0) * DECAY_RATE
-            new_importance = max(0, row["importance"] - decay_amount)
+            new_importance = max(0.0, base - decay_amount)
 
             if new_importance != row["importance"]:
                 conn.execute(
@@ -223,16 +327,60 @@ def decay_importance(conn: sqlite3.Connection) -> int:
     return decayed
 
 
-def prune_low_importance(conn: sqlite3.Connection) -> int:
-    """Remove episodes below the importance cutoff."""
-    cursor = conn.execute(
-        "DELETE FROM episodes WHERE importance < ?",
+def prune_low_importance(conn: sqlite3.Connection, grace_days: float | None = None) -> int:
+    """Remove episodes below the importance cutoff that are also older than
+    `MEMORY_PRUNE_GRACE_DAYS` (measured from `inserted_at`, not `created_at`).
+
+    Without the grace period, a same-run episode scored 5-6 by
+    `score_importance()` (the range the Haiku prompt gives ordinary
+    interactions) was deleted the same night it was created — measured
+    2026-09-28: 96 episodes created, 93 pruned in the same run, net 3 kept.
+    """
+    if grace_days is None:
+        grace_days = MEMORY_PRUNE_GRACE_DAYS
+
+    grace_cutoff = datetime.now(timezone.utc) - timedelta(days=grace_days)
+
+    rows = conn.execute(
+        "SELECT id, inserted_at FROM episodes WHERE importance < ?",
         (IMPORTANCE_CUTOFF,)
-    )
-    pruned = cursor.rowcount
+    ).fetchall()
+
+    to_delete = []
+    for row in rows:
+        inserted_at = row["inserted_at"]
+        if not inserted_at:
+            # No inserted_at at all (shouldn't happen post-migration) — be
+            # conservative and leave it rather than delete blind.
+            continue
+        inserted_dt = None
+        for parser in (
+            lambda s: datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc),
+            lambda s: datetime.fromisoformat(s.replace("Z", "+00:00")),
+        ):
+            try:
+                inserted_dt = parser(inserted_at)
+                break
+            except (TypeError, ValueError):
+                continue
+        if inserted_dt is None:
+            log.warning(f"Could not parse inserted_at for episode {row['id']}: {inserted_at!r}")
+            continue
+        if inserted_dt.tzinfo is None:
+            inserted_dt = inserted_dt.replace(tzinfo=timezone.utc)
+        if inserted_dt <= grace_cutoff:
+            to_delete.append(row["id"])
+
+    pruned = 0
+    if to_delete:
+        conn.executemany(
+            "DELETE FROM episodes WHERE id = ?", [(i,) for i in to_delete]
+        )
+        pruned = len(to_delete)
+
     conn.commit()
     if pruned:
-        log.info(f"Pruned {pruned} low-importance episodes")
+        log.info(f"Pruned {pruned} low-importance episodes older than {grace_days}d")
     return pruned
 
 
@@ -305,7 +453,7 @@ def write_health(success: bool, stats: dict) -> None:
     }))
 
 
-def process_messages_to_episodes(conn: sqlite3.Connection) -> tuple[int, list]:
+def process_messages_to_episodes(conn: sqlite3.Connection, stats: dict | None = None) -> tuple[int, list]:
     """Process yesterday's messages into episodes.
 
     Returns (created_count, new_episodes) where new_episodes is a list of
@@ -313,6 +461,10 @@ def process_messages_to_episodes(conn: sqlite3.Connection) -> tuple[int, list]:
     needed by extract_candidate_facts() below so fact extraction only
     looks at what's actually new, and so every extracted fact can cite a
     real, just-inserted episode id rather than a model-guessed one.
+
+    `stats`, when passed, is forwarded to `score_importance()` so a scoring
+    failure that falls all the way back to a default gets counted in the
+    run's health stats (`score_failures`).
     """
     messages = read_previous_day_messages()
     if not messages:
@@ -327,16 +479,17 @@ def process_messages_to_episodes(conn: sqlite3.Connection) -> tuple[int, list]:
             continue
 
         summary = create_episode_summary(episode_msgs)
-        importance = score_importance(summary)
+        importance = score_importance(summary, stats)
 
         # Extract metadata
         channel = episode_msgs[0].get("channel_name", "unknown")
         created_at = episode_msgs[0].get("ts", datetime.now(timezone.utc).isoformat())
 
         cursor = conn.execute(
-            """INSERT INTO episodes (summary, importance, channel, created_at)
-               VALUES (?, ?, ?, ?)""",
-            (summary, importance, channel, created_at)
+            """INSERT INTO episodes
+               (summary, importance, base_importance, channel, created_at, inserted_at)
+               VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+            (summary, importance, importance, channel, created_at)
         )
         new_episodes.append({"id": cursor.lastrowid, "summary": summary, "channel": channel})
         created += 1
@@ -502,16 +655,20 @@ def main():
     try:
         conn = init_db()
 
-        episodes_created, new_episodes = process_messages_to_episodes(conn)
+        stats = {"score_failures": 0}
+        episodes_created, new_episodes = process_messages_to_episodes(conn, stats)
 
-        stats = {
-            "episodes_created": episodes_created,
-            "decayed": decay_importance(conn),
-            "pruned": prune_low_importance(conn),
-            "consolidated": consolidate_episodes(conn),
-            "embedded": generate_embeddings(conn),
-        }
+        stats["episodes_created"] = episodes_created
+        stats["decayed"] = decay_importance(conn)
+        stats["pruned"] = prune_low_importance(conn)
+        stats["consolidated"] = consolidate_episodes(conn)
+        stats["embedded"] = generate_embeddings(conn)
         stats.update(extract_facts_from_episodes(conn, new_episodes))
+
+        newest = conn.execute(
+            "SELECT MAX(inserted_at) AS newest FROM episodes"
+        ).fetchone()
+        stats["newest_inserted_at"] = newest["newest"] if newest else None
 
         conn.close()
         duration = round(time.time() - start, 2)

@@ -300,3 +300,64 @@ class TestTaskboardEmailIntakeMarkRead:
 
         assert result["task"]["status"] == "done"
         assert "error" not in result
+
+
+class TestMemoryRemember:
+    """`memory` tool's `remember` action — the first production write path
+    into `facts`. Before this, `git grep -n "INSERT INTO facts"` found
+    nothing outside test fixtures."""
+
+    def test_remember_works_before_memory_db_exists(self, tools_server, tmp_path):
+        """Every other `memory` action errors against a DB that was never
+        created; `remember` must not, since it needs to work on a fresh
+        install before the first 3 AM maintenance pass."""
+        memory_db = tmp_path / "data" / "memory" / "memory.db"
+        assert not memory_db.exists()
+
+        result = tools_server.handle_core_tool(
+            "memory",
+            {"action": "remember", "subject": "Crab Cavern", "content": "The second Discord server."},
+        )
+
+        assert "error" not in result
+        assert result["status"] == "ok"
+        assert memory_db.exists()
+
+    def test_remember_inserts_one_row_with_defaults(self, tools_server, tmp_path):
+        result = tools_server.handle_core_tool(
+            "memory",
+            {"action": "remember", "subject": "Ian", "content": "Runs Marvin."},
+        )
+
+        assert result["confidence"] == 0.8
+        assert result["domain"] == "general"
+
+        memory_db = tmp_path / "data" / "memory" / "memory.db"
+        import sqlite3
+        conn = sqlite3.connect(str(memory_db))
+        rows = conn.execute("SELECT subject, content FROM facts").fetchall()
+        conn.close()
+        assert rows == [("Ian", "Runs Marvin.")]
+
+    def test_remember_rejects_empty_subject(self, tools_server):
+        result = tools_server.handle_core_tool(
+            "memory", {"action": "remember", "subject": "  ", "content": "something"}
+        )
+        assert "error" in result
+
+    def test_remember_rejects_empty_content(self, tools_server):
+        result = tools_server.handle_core_tool(
+            "memory", {"action": "remember", "subject": "X", "content": "   "}
+        )
+        assert "error" in result
+
+    def test_remember_clamps_confidence(self, tools_server):
+        result = tools_server.handle_core_tool(
+            "memory",
+            {"action": "remember", "subject": "X", "content": "Y", "confidence": 5.0},
+        )
+        assert result["confidence"] == 1.0
+
+    def test_recall_still_errors_when_db_missing(self, tools_server):
+        result = tools_server.handle_core_tool("memory", {"action": "recall", "query": "anything"})
+        assert result == {"error": "Memory database not found"}
