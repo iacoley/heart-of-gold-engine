@@ -2012,6 +2012,65 @@ def load_memory_index(agent: str) -> str:
         return ""
 
 
+def load_stored_facts(agent: str = "", limit: int = 50) -> str:
+    """Load learned facts from SQLite facts table and memory candidates into prompt.
+
+    Provides the missing retrieval loop for durable memory: facts recorded live
+    via `memory.remember` (or extracted by nightly maintenance) are injected
+    into the agent's --append-system-prompt at startup/resume so learned
+    knowledge persists across session resets without requiring manual edits to
+    static files. Also checks data/memory-candidates/ if available.
+    """
+    facts_lines = []
+
+    # 1. Query SQLite memory.db if available
+    db_path = WORKSPACE_ROOT / "data" / "memory" / "memory.db"
+    if db_path.exists():
+        try:
+            import sqlite3
+            conn = sqlite3.connect(db_path, timeout=5.0)
+            conn.row_factory = sqlite3.Row
+            table_check = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='facts'"
+            ).fetchone()
+            if table_check:
+                rows = conn.execute(
+                    "SELECT subject, content, domain FROM facts ORDER BY id DESC LIMIT ?",
+                    (limit,)
+                ).fetchall()
+                for r in rows:
+                    domain_tag = f" [{r['domain']}]" if r["domain"] and r["domain"] != "general" else ""
+                    facts_lines.append(f"- **{r['subject']}{domain_tag}:** {r['content']}")
+            conn.close()
+        except Exception as e:
+            log.warning(f"Failed to load facts from {db_path}: {e}")
+
+    # 2. Check recent candidates if DB had few or no facts
+    if len(facts_lines) < 10:
+        candidates_dir = WORKSPACE_ROOT / "data" / "memory-candidates"
+        if candidates_dir.exists():
+            try:
+                candidate_files = sorted(candidates_dir.glob("*.md"), reverse=True)[:3]
+                for cf in candidate_files:
+                    try:
+                        content = cf.read_text().strip()
+                        for line in content.splitlines():
+                            if line.startswith("- **") and line not in facts_lines:
+                                facts_lines.append(line)
+                                if len(facts_lines) >= limit:
+                                    break
+                    except Exception:
+                        pass
+            except Exception as e:
+                log.warning(f"Failed to load memory candidates: {e}")
+
+    if not facts_lines:
+        return ""
+
+    header = "# Learned Facts & Persistent Memory\n\nDurable knowledge recorded from previous interactions:"
+    return header + "\n\n" + "\n".join(facts_lines[:limit])
+
+
 def load_onboarding_prompt(agent: str) -> str:
     """Return the onboarding prompt iff persona is empty.
 
@@ -2071,6 +2130,14 @@ async def start_agent_subprocess(agent: str):
     if memory_index:
         persona_content = (
             memory_index + ("\n\n" + persona_content if persona_content else "")
+        )
+
+    # Load stored facts from persistent memory (learned facts layer)
+    stored_facts = load_stored_facts(agent)
+    if stored_facts:
+        log.info(f"Injecting stored facts for {agent} into system prompt")
+        persona_content = (
+            stored_facts + ("\n\n" + persona_content if persona_content else "")
         )
 
     # First-boot gate: if no persona has been written yet, prepend the
