@@ -189,7 +189,7 @@ class TestProcessMessagesToEpisodesReturnShape:
         """process_messages_to_episodes() used to return just an int
         count; Track 1 needs the new episode ids too, so the signature
         changed to (count, [{"id", "summary", "channel"}, ...])."""
-        monkeypatch.setattr(mm, "score_importance", lambda summary: 6.0)
+        monkeypatch.setattr(mm, "score_importance", lambda summary, stats=None: 6.0)
 
         import datetime as _dt
         yesterday = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=1)).strftime("%Y-%m-%d")

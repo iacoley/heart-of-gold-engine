@@ -152,11 +152,20 @@ At 85% context budget:
 
 ### Episodes
 - Captured from conversations
-- Importance scores decay over time
+- Importance scores decay over time (idempotently, from a fixed
+  `base_importance` set at creation — decaying the same episode on
+  successive nightly runs converges rather than compounding)
+- Dropped below `MEMORY_CUTOFF` only once older than `MEMORY_PRUNE_GRACE_DAYS`
+  (default 7, measured from `inserted_at`, the DB-write time) — otherwise a
+  same-run episode scored in the ordinary 5-6 range gets deleted the night
+  it's created
 - Consolidated when short/redundant
 
 ### Facts
 - Extracted from episodes
+- Also written directly via `memory.remember` (subject, content,
+  confidence?, domain?) — the only live write path into `facts` outside the
+  nightly maintenance pass; works before `memory.db` exists
 - Stored with subject, confidence, domain
 - Injected as context on session start
 

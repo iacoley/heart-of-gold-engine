@@ -241,5 +241,8 @@ All configuration lives in `config/.env`. Key variables:
 | `COST_DAILY_LIMIT` | Daily spend cap in USD |
 | `COST_MONTHLY_LIMIT` | Monthly spend cap in USD |
 | `MAX_CONCURRENT_BUILDERS` | Parallel builder agents |
-| `MEMORY_DECAY_RATE` | Episode importance decay (0-1) |
+| `MEMORY_DECAY_RATE` | Episode importance decay per pass (0-1), applied from `base_importance` |
+| `MEMORY_CUTOFF` | Importance below which an episode is eligible to be dropped (default 6.0) |
+| `MEMORY_PRUNE_GRACE_DAYS` | Days an episode is protected from pruning regardless of score, measured from `inserted_at`; default 7 |
+| `MEMORY_SCORE_TIMEOUT` / `MEMORY_SCORE_RETRY_TIMEOUT` | Haiku importance-scoring call timeout, first attempt and retry; default 20s / 60s |
 | `MESSAGE_RETENTION_DAYS` | JSONL log retention |
