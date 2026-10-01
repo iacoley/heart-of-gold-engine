@@ -2999,6 +2999,8 @@ async def read_agent_response(
     metadata = {}
     last_posted_chunk = ""
     last_assistant_usage: Dict[str, Any] = {}
+    active_model = None
+    model_logged = False
 
     # Chunked/interim Discord streaming (added 2026-08-06, per Ian: "make
     # sure the interstitial thinking phrases get spoken while cogitating
@@ -3102,8 +3104,20 @@ async def read_agent_response(
             # `assistant` events with content blocks (thinking/text/tool_use),
             # then a single `result` event closes the turn.
             if event_type == "assistant":
+                parent_id = event.get("parent_tool_use_id") or (event.get("message") or {}).get("parent_tool_use_id")
+                if parent_id:
+                    # Ignore nested subagent output from leaking into top-level Discord output
+                    continue
+
                 message = event.get("message", {}) or {}
                 got_text = False
+
+                model_name = message.get("model") or event.get("model")
+                if model_name:
+                    active_model = model_name
+                    if not model_logged:
+                        log.info(f"{agent} running active model: {model_name}")
+                        model_logged = True
 
                 # Real per-turn context size (2026-08-06 fix). The old
                 # code summed cache_read_input_tokens etc. off the
@@ -3250,11 +3264,19 @@ async def read_agent_response(
                     "total_cost_usd": event.get("total_cost_usd", 0.0),
                     "duration_ms": event.get("duration_ms", 0),
                     "is_error": event.get("is_error", False),
+                    "model": active_model or event.get("model"),
                 }
-                # If the assistant stream produced nothing, fall back to
-                # the result's flat `result` string (success) or `error`.
-                if not final_text:
-                    final_text = event.get("result", "") or event.get("error", "")
+                if metadata["model"] and not model_logged:
+                    log.info(f"{agent} running active model: {metadata['model']}")
+                    model_logged = True
+
+                # Prefer result event's final clean result string when available,
+                # preventing top-level interim narration from remaining concatenated.
+                res_str = event.get("result", "")
+                if res_str:
+                    final_text = res_str
+                elif not final_text:
+                    final_text = event.get("error", "")
                 # Monthly-spend-cap hard-stop (2026-08-18) — arrives
                 # exactly this way: no assistant content, just this flat
                 # fallback string. Flag it for process_agent_queue and
