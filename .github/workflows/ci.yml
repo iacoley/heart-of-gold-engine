@@ -3,8 +3,14 @@ name: CI
 on:
   push:
     branches: [main]
+  # No base-branch filter: stacked PRs (base = another PR's branch) get CI too.
   pull_request:
-    branches: [main]
+
+# One run per PR; a new push cancels the in-flight run. Pushes to main are
+# keyed by SHA so they are never cancelled.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # Fast checks — runs in seconds, catches syntax and structure issues
