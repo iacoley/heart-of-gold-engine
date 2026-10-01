@@ -91,13 +91,19 @@ Use Read/Write/Edit tools for file operations whenever possible. Bash is for git
 
 ## Protected Paths
 
-These files require owner approval and are blocked by pre-commit hook:
+These Tier 1 files require owner approval (CODEOWNERS plus branch protection
+on `main`; see `config/protected-paths.json` and `docs/ARCHITECTURE.md`):
 - system/
 - config/
 - bin/agent-server.py
 - bin/relay.py
+- bin/entrypoint.sh
+- bin/scheduler.py
 - Dockerfile
-- .karakos/config.json
+- .karakos/
+
+Tier 2 files (listed in `config/protected-paths.json`) are enforced by this
+rule only: flag them in the PR description for extra review.
 
 If you need to modify these, note it in the PR description and request owner review.
 
