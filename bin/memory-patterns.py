@@ -33,6 +33,7 @@ Called by scheduler weekly (see bin/scheduler.py).
 """
 
 import json
+from claude_bin import claude_bin
 import logging
 import os
 import re
@@ -156,7 +157,7 @@ Excerpt: {summary}"""
 
     try:
         result = subprocess.run(
-            ["claude", "-p", prompt, "--model", "haiku", "--max-turns", "1"],
+            [claude_bin(), "-p", prompt, "--model", "haiku", "--max-turns", "1"],
             capture_output=True,
             text=True,
             timeout=20,

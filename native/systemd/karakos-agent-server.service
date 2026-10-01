@@ -15,6 +15,11 @@ Group=karakos
 WorkingDirectory=/opt/karakos
 Environment=HOME=/home/karakos
 Environment=WORKSPACE_ROOT=/opt/karakos
+# The claude CLI is load-bearing and was previously found only via systemd's
+# default PATH. Removing the npm-global install (/usr/bin/claude) once took
+# the whole system down with a bare "No such file or directory: 'claude'".
+# Replace this path if the install moves.
+Environment=CLAUDE_BIN=/usr/bin/claude
 EnvironmentFile=/opt/karakos/config/.env
 
 # Absolute interpreter + script path — no shell, so no venv activate.

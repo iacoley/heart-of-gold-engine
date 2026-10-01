@@ -39,6 +39,7 @@ concurrent read-modify-write safety.
 from __future__ import annotations
 
 import fcntl
+from claude_bin import claude_bin
 import json
 import logging
 import os
@@ -100,7 +101,7 @@ def trigger_relogin_relay() -> bool:
     try:
         with open(RELOGIN_OUTPUT_PATH, "w") as out:
             subprocess.Popen(
-                ["claude", "auth", "login", "--claudeai"],
+                [claude_bin(), "auth", "login", "--claudeai"],
                 stdout=out,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,

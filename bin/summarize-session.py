@@ -7,6 +7,7 @@ required headers, and outputs to checkpoint file for next session re-injection.
 """
 
 import argparse
+from claude_bin import claude_bin
 import json
 import os
 import sqlite3
@@ -147,7 +148,7 @@ def call_summarizer(stream_content: str) -> tuple[bool, str, dict]:
     prompt = SUMMARIZER_PROMPT.format(stream_content=stream_content)
 
     cmd = [
-        "claude", "-p", prompt,
+        claude_bin(), "-p", prompt,
         "--model", "sonnet",
         "--max-turns", "1",
         "--output-format", "stream-json",
