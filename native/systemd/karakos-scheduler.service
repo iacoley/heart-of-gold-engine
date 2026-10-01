@@ -7,7 +7,14 @@ Wants=network-online.target
 # stopped this unit on every agent-server bounce and never restarted it,
 # leaving it dead for ~9h after the 09:34 restart-server test until
 # manually started.
-Requires=karakos-agent-server.service
+# Wants=, not Requires= (changed 2026-10-01): Requires= still propagates
+# restarts. When agent-server exits and systemd relaunches it, this unit
+# gets stopped and restarted alongside it. For relay that killed
+# /restart-server's own handler mid-poll, so the Discord interaction sat on
+# "thinking..." forever (every run since 09-15 ends at "polling for new
+# boot_id", never "new boot_id seen"). Wants= keeps the start ordering
+# (via After=) without tying this unit's lifetime to agent-server's.
+Wants=karakos-agent-server.service
 
 [Service]
 Type=simple
