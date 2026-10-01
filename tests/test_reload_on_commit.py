@@ -84,6 +84,7 @@ def test_main_dispatches_bounce_asynchronously(tmp_path, monkeypatch):
     monkeypatch.setattr(reload_on_commit, "WORKSPACE_ROOT", tmp_path)
     monkeypatch.setattr(reload_on_commit, "EVENTS_LOG", tmp_path / "logs" / "git-events.jsonl")
     monkeypatch.setattr(reload_on_commit, "get_committed_files", lambda: ["bin/relay.py"])
+    monkeypatch.setattr(reload_on_commit, "commit_toplevel", lambda: tmp_path.resolve())
 
     popen_calls = []
 
@@ -127,3 +128,65 @@ def test_main_dispatches_bounce_asynchronously(tmp_path, monkeypatch):
     assert not any(e.get("event") == "auto_reload" for e in events), (
         "old synchronous event name should be gone, not just supplemented"
     )
+
+
+def _run_main(monkeypatch, workspace, toplevel):
+    monkeypatch.setattr(reload_on_commit, "WORKSPACE_ROOT", workspace)
+    monkeypatch.setattr(reload_on_commit, "EVENTS_LOG", workspace / "logs" / "git-events.jsonl")
+    monkeypatch.setattr(reload_on_commit, "get_committed_files", lambda: ["bin/relay.py"])
+    monkeypatch.setattr(reload_on_commit, "commit_toplevel", lambda: toplevel)
+    popen_calls = []
+    monkeypatch.setattr(
+        reload_on_commit.subprocess, "Popen", lambda *a, **k: popen_calls.append(a)
+    )
+
+    class Result:
+        stdout = "deadbeef\n"
+        returncode = 0
+
+    monkeypatch.setattr(reload_on_commit.subprocess, "run", lambda *a, **k: Result())
+    reload_on_commit.main()
+    return popen_calls
+
+
+def test_commit_in_other_worktree_does_not_restart(tmp_path, monkeypatch):
+    live = tmp_path / "live"
+    other = live / ".claude" / "worktrees" / "agent-x"
+    other.mkdir(parents=True)
+    calls = _run_main(monkeypatch, live, other.resolve())
+    assert calls == []
+    lines = (live / "logs" / "git-events.jsonl").read_text().splitlines()
+    assert [json.loads(l)["event"] for l in lines] == ["auto_reload_skipped_other_worktree"]
+
+
+def test_commit_in_live_root_restarts(tmp_path, monkeypatch):
+    calls = _run_main(monkeypatch, tmp_path, tmp_path.resolve())
+    assert len(calls) == 1
+    assert calls[0][0][-2:] == ["restart", "karakos-relay.service"]
+
+
+def test_symlinked_workspace_root_counts_as_live(tmp_path, monkeypatch):
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    calls = _run_main(monkeypatch, link, real.resolve())
+    assert len(calls) == 1
+
+
+def test_git_calls_use_hook_cwd(monkeypatch):
+    seen = []
+
+    def fake_run(args, **kwargs):
+        seen.append(kwargs)
+
+        class R:
+            stdout = "bin/relay.py\n"
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(reload_on_commit.subprocess, "run", fake_run)
+    assert reload_on_commit.get_committed_files() == ["bin/relay.py"]
+    reload_on_commit.commit_toplevel()
+    assert all("cwd" not in k for k in seen)
