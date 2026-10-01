@@ -4439,12 +4439,27 @@ async def handle_agent_reset(request):
 
 
 async def handle_agent_reload(request):
-    """POST /agents/{name}/reload - Bounce subprocess, preserve session."""
+    """POST /agents/{name}/reload - Bounce subprocess, preserve session.
+
+    Re-reads agents.json (and channels.json) via load_config() first —
+    added 2026-10-01 after a model-field change to an already-running
+    agent silently didn't take effect: reload_agent() respawns from the
+    in-memory agent_config dict, which load_config() only ever populated
+    once, at this process's own startup. Without this, picking up a
+    config edit for a live agent needed a full agent-server.py restart
+    (Ian-only authority) even though the per-agent reload is otherwise
+    self-service. Same ordering as handle_agent_register below: reload
+    config before validating the agent name, so a config edit that adds
+    or changes an entry is visible to the very check that gates on it.
+    """
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     agent = request.match_info.get("name")
+
+    await load_config()
+
     if agent not in agent_config:
         return web.json_response({"error": "Unknown agent"}, status=404)
 
