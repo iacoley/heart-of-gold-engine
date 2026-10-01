@@ -176,12 +176,26 @@ At 85% context budget:
 
 ## Protected Paths
 
-Two-tier git hook enforcement:
+`config/protected-paths.json` defines two tiers. What actually enforces each:
 
-- **Tier 1** (hard block): `system/`, `config/`, `bin/agent-server.py`, `bin/relay.py`, `Dockerfile`
-- **Tier 2** (warn): `bin/scheduler.py`, `bin/entrypoint.sh`, `mcp/tools-server.py`
+- **Tier 1** (owner approval required): `system/`, `config/`, `bin/agent-server.py`,
+  `bin/relay.py`, `bin/entrypoint.sh`, `bin/scheduler.py`, `.karakos/`, `Dockerfile`.
+  Enforced by **`.github/CODEOWNERS`** (every Tier 1 path is owned by the repo
+  owner) together with the **"Require review from Code Owners"** setting in
+  branch protection on `main`. That setting is a repo-admin switch and cannot be
+  committed; without it CODEOWNERS only auto-requests review. A CI test
+  (`tests/test_codeowners_sync.py`) fails if a Tier 1 path is missing from
+  CODEOWNERS.
+- **Tier 2** (review required): a named list of harness-critical files plus
+  `agents/templates/` and `mcp/tools-server.py`. Enforced **only by agent
+  prompt rules** (builder/reviewer templates); nothing mechanical blocks it.
+  Reviewers are expected to apply extra scrutiny.
 
-Builder agents can't commit to Tier 1 paths. Changes require PR review by the owner.
+There is no server-side git hook. `system/check-protected-paths.py` and
+`system/install-hooks.sh` provide an optional *local* pre-commit check
+(`native/start.sh` installs it into a workspace checkout), but it is
+bypassable (`--no-verify`) and never runs on GitHub, so it is a convenience,
+not enforcement.
 
 ## Data Layout
 

@@ -2128,7 +2128,7 @@ INERT_ENV_ALLOWLIST = (
     "PATH", "HOME", "USER", "SHELL", "TERM", "LANG", "LC_ALL", "TMPDIR",
     "PAGER", "LESS", "XDG_CONFIG_HOME",
     # Karakos operational config
-    "WORKSPACE_ROOT", "KARAKOS_LOG_DIR", "AGENT_SERVER_PORT",
+    "WORKSPACE_ROOT", "KARAKOS_ENV_FILE", "KARAKOS_LOG_DIR", "AGENT_SERVER_PORT",
     "AGENT_SERVER_URL", "AGENT_BRIDGE_HOST", "OWNER_DISCORD_ID",
     "OWNER_NAME", "SYSTEM_NAME", "KARAKOS_DISCORD_API_BASE",
     "COST_DAILY_LIMIT", "COST_MONTHLY_LIMIT", "COST_WARNING_THRESHOLD",
@@ -2168,6 +2168,17 @@ def build_subprocess_env(agent: str) -> dict:
         if key in os.environ
     }
     env["AGENT_NAME"] = agent
+    # Call-time GitHub credentials (issue #30): no token in env. git finds
+    # a credential helper via GIT_CONFIG_* (inherited by every git, incl.
+    # worktrees and in-process subagents), and the gh shim dir leads PATH.
+    # Both read the token fresh from config/.env per call.
+    bin_dir = Path(__file__).resolve().parent
+    env["GIT_CONFIG_COUNT"] = "1"
+    env["GIT_CONFIG_KEY_0"] = "credential.https://github.com.helper"
+    env["GIT_CONFIG_VALUE_0"] = str(bin_dir / "git-credential-karakos")
+    env["PATH"] = os.pathsep.join(
+        p for p in (str(bin_dir / "shims"), env.get("PATH", "")) if p
+    )
     return env
 
 
@@ -2537,6 +2548,24 @@ async def post_to_discord(agent: str, channel_id: str, content: str, reply_to: O
         log.info(
             f"post_to_discord: suppressing whitespace/empty content for "
             f"{agent} in {channel_id} (silence discipline, task-1788365086)"
+        )
+        return None
+
+    # Same structural reasoning as the empty-content guard just above, now
+    # covering the other way a "stay silent" turn leaks: a literal PASS
+    # sentinel or a silence-announcement ("Not my mention", etc.) that
+    # survives as non-empty text. The live-turn path (process_agent_queue,
+    # ~line 3859) and crash_recovery()'s retry loop already pre-filter on
+    # is_silence_announcement() before calling this function — but the
+    # 2026-10-01 00:48 UTC incident (task-1790732906) happened precisely
+    # because crash_recovery() had its own independent post call that
+    # forgot to. Belt-and-suspenders: put the check here too, in the one
+    # function every posting path funnels through, so a future third
+    # caller that forgets to pre-filter still can't leak PASS to Discord.
+    if is_silence_announcement(content):
+        log.info(
+            f"post_to_discord: suppressing PASS/silence-announcement content for "
+            f"{agent} in {channel_id} (silence discipline, task-1790732906)"
         )
         return None
 
@@ -2981,6 +3010,8 @@ async def read_agent_response(
     metadata = {}
     last_posted_chunk = ""
     last_assistant_usage: Dict[str, Any] = {}
+    active_model = None
+    model_logged = False
 
     # Chunked/interim Discord streaming (added 2026-08-06, per Ian: "make
     # sure the interstitial thinking phrases get spoken while cogitating
@@ -3084,8 +3115,20 @@ async def read_agent_response(
             # `assistant` events with content blocks (thinking/text/tool_use),
             # then a single `result` event closes the turn.
             if event_type == "assistant":
+                parent_id = event.get("parent_tool_use_id") or (event.get("message") or {}).get("parent_tool_use_id")
+                if parent_id:
+                    # Ignore nested subagent output from leaking into top-level Discord output
+                    continue
+
                 message = event.get("message", {}) or {}
                 got_text = False
+
+                model_name = message.get("model") or event.get("model")
+                if model_name:
+                    active_model = model_name
+                    if not model_logged:
+                        log.info(f"{agent} running active model: {model_name}")
+                        model_logged = True
 
                 # Real per-turn context size (2026-08-06 fix). The old
                 # code summed cache_read_input_tokens etc. off the
@@ -3232,11 +3275,19 @@ async def read_agent_response(
                     "total_cost_usd": event.get("total_cost_usd", 0.0),
                     "duration_ms": event.get("duration_ms", 0),
                     "is_error": event.get("is_error", False),
+                    "model": active_model or event.get("model"),
                 }
-                # If the assistant stream produced nothing, fall back to
-                # the result's flat `result` string (success) or `error`.
-                if not final_text:
-                    final_text = event.get("result", "") or event.get("error", "")
+                if metadata["model"] and not model_logged:
+                    log.info(f"{agent} running active model: {metadata['model']}")
+                    model_logged = True
+
+                # Prefer result event's final clean result string when available,
+                # preventing top-level interim narration from remaining concatenated.
+                res_str = event.get("result", "")
+                if res_str:
+                    final_text = res_str
+                elif not final_text:
+                    final_text = event.get("error", "")
                 # Monthly-spend-cap hard-stop (2026-08-18) — arrives
                 # exactly this way: no assistant content, just this flat
                 # fallback string. Flag it for process_agent_queue and
@@ -4118,13 +4169,40 @@ async def crash_recovery():
         # so this stops recurring; genuinely retryable rows (real response
         # text, just never confirmed posted) still go through below as before.
         empty = [m for m in unposted if not m["response"]]
-        retryable = [m for m in unposted if m["response"]]
+        # PASS-sentinel / silence-announcement rows are a legitimate "stay
+        # silent" turn that never got to mark itself posted (e.g. the
+        # process restarted between generating the response and confirming
+        # the post — see the 2026-10-01 00:48 UTC incident: 17 bare PASS
+        # rows leaked into #agent-chat because this loop reposted them with
+        # no screening). The live-turn posting path gates every post on
+        # is_silence_announcement() before calling post_to_discord(); this
+        # recovery loop is the only other caller of post_to_discord() for
+        # these rows and must apply the same gate. Mark them STATUS_SKIPPED
+        # like the empty bucket above, so they don't get reposted here and
+        # don't get rediscovered on every future startup.
+        pass_sentinel = [
+            m for m in unposted
+            if m["response"] and is_silence_announcement(m["response"])
+        ]
+        pass_sentinel_ids = {m["message_id"] for m in pass_sentinel}
+        retryable = [
+            m for m in unposted
+            if m["response"] and m["message_id"] not in pass_sentinel_ids
+        ]
 
         if empty:
             log.info(f"Marking {len(empty)} empty-response stale rows as skipped (never postable, pre-2026-08-11 mid-turn-kill artifacts)")
             await db.executemany(
                 "UPDATE message_queue SET processed = ? WHERE message_id = ?",
                 [(STATUS_SKIPPED, m["message_id"]) for m in empty]
+            )
+            await db.commit()
+
+        if pass_sentinel:
+            log.info(f"Marking {len(pass_sentinel)} PASS-sentinel/silence-announcement stale rows as skipped (legitimate stay-silent turns, never to be posted)")
+            await db.executemany(
+                "UPDATE message_queue SET processed = ? WHERE message_id = ?",
+                [(STATUS_SKIPPED, m["message_id"]) for m in pass_sentinel]
             )
             await db.commit()
 

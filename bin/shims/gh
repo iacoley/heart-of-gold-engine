@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# gh shim: reads the GitHub token fresh and execs the real gh with
+# GH_TOKEN set for that one process only. The token is never in the
+# ambient agent env. Env file: $KARAKOS_ENV_FILE, else <package root>/config/.env.
+set -u
+self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+env_file="${KARAKOS_ENV_FILE:-$self_dir/../../config/.env}"
+
+# Find the real gh: PATH minus this shim dir (no recursion).
+clean_path=""
+IFS=: read -ra parts <<< "${PATH:-}"
+for p in "${parts[@]}"; do
+  [ -z "$p" ] && continue
+  rp="$(cd "$p" 2>/dev/null && pwd -P)" || continue
+  [ "$rp" = "$self_dir" ] && continue
+  clean_path="${clean_path:+$clean_path:}$p"
+done
+real_gh="$(PATH="$clean_path" command -v gh || true)"
+if [ -z "$real_gh" ]; then
+  echo "gh shim: real gh not found on PATH" >&2
+  exit 127
+fi
+
+token=""
+if [ -r "$env_file" ]; then
+  token="$(sed -n -E 's/^[[:space:]]*(export[[:space:]]+)?GITHUB_TOKEN[[:space:]]*=[[:space:]]*//p' "$env_file" | tail -n1)"
+  token="${token%\"}"; token="${token#\"}"; token="${token%\'}"; token="${token#\'}"
+fi
+
+if [ -n "$token" ]; then
+  GH_TOKEN="$token" exec "$real_gh" "$@"
+fi
+exec "$real_gh" "$@"

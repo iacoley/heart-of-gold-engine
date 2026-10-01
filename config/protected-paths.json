@@ -11,7 +11,17 @@
     "config/protected-paths.json"
   ],
   "tier2_review_required": [
-    "bin/",
+    "bin/outbox.py",
+    "bin/reply_gate.py",
+    "bin/pass_filter.py",
+    "bin/handoff.py",
+    "bin/auth_guard.py",
+    "bin/health-monitor.py",
+    "bin/recovery-agent.py",
+    "bin/memory-maintenance.py",
+    "bin/restart-service.sh",
+    "bin/invoke-builder.sh",
+    "bin/invoke-reviewer.sh",
     "agents/templates/",
     "mcp/tools-server.py"
   ],
