@@ -339,6 +339,16 @@ def validate_args(args: dict, schema: dict) -> str | None:
 # Tool Dispatch
 # =============================================================================
 
+def _retrieval():
+    """BM25 (+ optional embedding) retrieval shared with agent-server's per-turn
+    injection. bin/ is a sibling of mcp/ in the package layout."""
+    import importlib
+    bin_dir = str(Path(__file__).resolve().parent.parent / "bin")
+    if bin_dir not in sys.path:
+        sys.path.insert(0, bin_dir)
+    return importlib.import_module("memory_retrieval")
+
+
 def _memory_action(conn, action: str, args: dict) -> dict:
     """Run one `memory` tool action against an open connection. The caller
     owns the connection and closes it on every path."""
@@ -354,6 +364,14 @@ def _memory_action(conn, action: str, args: dict) -> dict:
 
     elif action == "recall":
         query = args.get("query", "")
+        try:
+            hits = _retrieval().search(conn, query, kinds=("episode",), k=limit)
+            return {"episodes": [
+                {"id": h.id, "summary": h.text, "importance": h.importance, "created_at": h.created_at}
+                for h in hits
+            ]}
+        except Exception:
+            pass  # retrieval unavailable: fall back to substring search
         rows = conn.execute(
             "SELECT id, summary, importance, created_at FROM episodes "
             "WHERE summary LIKE ? ORDER BY importance DESC LIMIT ?",
@@ -363,6 +381,15 @@ def _memory_action(conn, action: str, args: dict) -> dict:
 
     elif action == "facts":
         query = args.get("query", "")
+        try:
+            hits = _retrieval().search(conn, query, kinds=("fact",), k=limit)
+            return {"facts": [
+                {"id": h.id, "subject": h.subject, "content": h.text,
+                 "confidence": h.confidence, "domain": h.domain}
+                for h in hits
+            ]}
+        except Exception:
+            pass  # retrieval unavailable: fall back to substring search
         rows = conn.execute(
             "SELECT id, subject, content, confidence, domain FROM facts "
             "WHERE content LIKE ? OR subject LIKE ? LIMIT ?",
