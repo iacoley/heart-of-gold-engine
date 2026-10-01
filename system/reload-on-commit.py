@@ -76,10 +76,26 @@ SELF_PROCESS_WARN = {
 }
 
 
+def commit_toplevel() -> Path | None:
+    """Toplevel of the worktree the commit happened in (the hook's own cwd)."""
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True,
+    )
+    out = result.stdout.strip()
+    return Path(out).resolve() if result.returncode == 0 and out else None
+
+
+def is_live_checkout(toplevel: Path | None) -> bool:
+    return toplevel is not None and toplevel == WORKSPACE_ROOT.resolve()
+
+
 def get_committed_files() -> list[str]:
+    # No cwd override: run in the hook's own cwd so HEAD is the commit that
+    # was actually just made (git sets cwd to the committing worktree's
+    # toplevel), not the live checkout's HEAD.
     result = subprocess.run(
         ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
-        capture_output=True, text=True, cwd=str(WORKSPACE_ROOT),
+        capture_output=True, text=True,
     )
     return [f.strip() for f in result.stdout.strip().split("\n") if f.strip()]
 
@@ -108,6 +124,17 @@ def _log(event: dict) -> None:
 
 
 def main():
+    top = commit_toplevel()
+    if not is_live_checkout(top):
+        _log({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": "auto_reload_skipped_other_worktree",
+            "worktree": str(top),
+            "note": "commit was in a different worktree than the live checkout; no restart",
+        })
+        print(f"reload-on-commit: skipped, commit was in a different worktree ({top})")
+        return
+
     changed = get_committed_files()
     to_bounce, warnings = plan_reloads(changed)
 
@@ -115,7 +142,7 @@ def main():
         return
 
     commit_sha = subprocess.run(
-        ["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=str(WORKSPACE_ROOT)
+        ["git", "rev-parse", "HEAD"], capture_output=True, text=True
     ).stdout.strip()
 
     for label, unit in to_bounce.items():
