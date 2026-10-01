@@ -17,8 +17,12 @@ export async function POST(
     });
 
     if (!response.ok) {
+      let detail = response.statusText;
+      try {
+        detail = (await response.json()).error || detail;
+      } catch {}
       return NextResponse.json(
-        { error: `Failed to reload agent: ${response.statusText}` },
+        { error: `Failed to reload agent: ${detail}` },
         { status: response.status }
       );
     }

@@ -979,8 +979,14 @@ class DiscordAdapter(discord.Client):
                     f"{AGENT_SERVER_URL}/agents/{agent}/reload", headers=headers
                 ) as resp:
                     ok = resp.status == 200
+                    detail = ""
+                    if not ok:
+                        try:
+                            detail = (await resp.json()).get("error", "")
+                        except Exception:
+                            pass
                 return (f"**/sys reload** `{agent}`: "
-                        f"{'done — session preserved' if ok else f'failed ({resp.status})'}")
+                        f"{'done — session preserved' if ok else f'failed ({resp.status})' + (f' — {detail}' if detail else '')}")
 
             if cmd == "halt":
                 # 2026-08-30, Ian's ask: a Discord-native equivalent of the

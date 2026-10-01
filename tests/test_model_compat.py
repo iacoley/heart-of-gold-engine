@@ -136,3 +136,77 @@ def test_unknown_version_does_not_refuse(agent_server, monkeypatch, tmp_path):
     with pytest.raises(AssertionError, match="spawn path reached"):
         asyncio.run(agent_server.start_agent_subprocess("marvin"))
     assert "marvin" not in agent_server.agent_spawn_refused
+
+
+# --- reload with a live subprocess -------------------------------------------
+
+class _LiveProc:
+    returncode = None
+    pid = 1
+
+
+def _reload_setup(agent_server, monkeypatch, tmp_path, cli_version):
+    fake_cli(monkeypatch, tmp_path, cli_version)
+    posts, spawned = _setup(agent_server, monkeypatch, "claude-opus-5-5")
+    live = _LiveProc()
+    monkeypatch.setitem(agent_server.agent_processes, "marvin", live)
+    killed = []
+
+    async def kill(agent):
+        killed.append(agent)
+
+    async def noop_load_config():
+        pass
+
+    monkeypatch.setattr(agent_server, "kill_agent_subprocess", kill)
+    monkeypatch.setattr(agent_server, "load_config", noop_load_config)
+    monkeypatch.setattr(agent_server, "AGENT_SERVER_TOKEN", "tok")
+    return live, killed, spawned
+
+
+class _Req:
+    headers = {"Authorization": "Bearer tok"}
+    match_info = {"name": "marvin"}
+
+
+def test_reload_too_old_keeps_live_process_and_returns_409(agent_server, monkeypatch, tmp_path):
+    live, killed, spawned = _reload_setup(agent_server, monkeypatch, tmp_path, "2.1.222 (Claude Code)")
+
+    resp = asyncio.run(agent_server.handle_agent_reload(_Req()))
+
+    assert resp.status == 409
+    assert b"2.1.222" in resp.body and b"left running" in resp.body
+    assert killed == []
+    assert agent_server.agent_processes["marvin"] is live
+    assert "marvin" not in agent_server.agent_spawn_refused  # still answering
+    assert len(spawned) == 1  # one #signals alert
+    for c in spawned:
+        c.close()
+
+
+def test_restart_too_old_keeps_live_process(agent_server, monkeypatch, tmp_path):
+    live, killed, spawned = _reload_setup(agent_server, monkeypatch, tmp_path, "2.1.222 (Claude Code)")
+    assert asyncio.run(agent_server.restart_agent("marvin")) is False
+    assert killed == [] and agent_server.agent_processes["marvin"] is live
+    for c in spawned:
+        c.close()
+
+
+def test_reload_new_enough_proceeds_to_kill_and_spawn(agent_server, monkeypatch, tmp_path):
+    live, killed, spawned = _reload_setup(agent_server, monkeypatch, tmp_path, "2.1.287 (Claude Code)")
+    # Passing preflight reaches kill, then the spawn path (sentinel raises).
+    with pytest.raises(AssertionError, match="spawn path reached"):
+        asyncio.run(agent_server.reload_agent("marvin"))
+    assert killed == ["marvin"]
+
+
+def test_reload_too_old_without_live_process_returns_409_refusal(agent_server, monkeypatch, tmp_path):
+    live, killed, spawned = _reload_setup(agent_server, monkeypatch, tmp_path, "2.1.222 (Claude Code)")
+    agent_server.agent_processes.pop("marvin")
+
+    resp = asyncio.run(agent_server.handle_agent_reload(_Req()))
+
+    assert resp.status == 409
+    assert "marvin" in agent_server.agent_spawn_refused
+    for c in spawned:
+        c.close()
