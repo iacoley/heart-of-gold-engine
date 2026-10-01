@@ -45,6 +45,26 @@ def test_register_endpoint_reloads_config():
     assert "start_agent_subprocess" in body
 
 
+def test_reload_endpoint_reloads_config_before_respawn():
+    """2026-10-01: reload_agent() respawns from the in-memory agent_config
+    dict, which load_config() only ever populated at process startup (or
+    inside handle_agent_register, for a *different* agent name). Without
+    a load_config() call here, editing agents.json for an already-running
+    agent — e.g. its model field — silently has no effect on /reload;
+    picking it up needed a full agent-server.py restart instead of the
+    self-service per-agent bounce this endpoint exists for. Also check the
+    ordering: load_config() must run before the agent_config membership
+    check below it, same as handle_agent_register, so a config edit that
+    adds/renames an entry is visible to the very check that gates on it."""
+    src = AGENT_SERVER.read_text()
+    reload_idx = src.index("async def handle_agent_reload")
+    next_def = src.index("\nasync def ", reload_idx + 1)
+    body = src[reload_idx:next_def]
+    assert "await load_config()" in body
+    assert "await reload_agent(agent)" in body
+    assert body.index("await load_config()") < body.index("if agent not in agent_config")
+
+
 def test_existing_routes_still_present():
     """Don't accidentally clobber the routes we already had."""
     src = AGENT_SERVER.read_text()

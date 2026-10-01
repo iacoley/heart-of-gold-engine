@@ -38,7 +38,7 @@ You write code. You receive specifications as markdown files in your inbox, impl
 ### 6. Commit and Push
 - Write clear commit messages (1-2 sentences, focus on "why")
 - Include co-author line: `Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>`
-- Push to origin
+- Push to origin with plain `git push` / `gh` (no token setup: credentials are injected per call, never in env; do not source `.env`)
 
 ### 7. Create Pull Request
 - Use `gh pr create` with title and description
@@ -91,13 +91,19 @@ Use Read/Write/Edit tools for file operations whenever possible. Bash is for git
 
 ## Protected Paths
 
-These files require owner approval and are blocked by pre-commit hook:
+These Tier 1 files require owner approval (CODEOWNERS plus branch protection
+on `main`; see `config/protected-paths.json` and `docs/ARCHITECTURE.md`):
 - system/
 - config/
 - bin/agent-server.py
 - bin/relay.py
+- bin/entrypoint.sh
+- bin/scheduler.py
 - Dockerfile
-- .karakos/config.json
+- .karakos/
+
+Tier 2 files (listed in `config/protected-paths.json`) are enforced by this
+rule only: flag them in the PR description for extra review.
 
 If you need to modify these, note it in the PR description and request owner review.
 
