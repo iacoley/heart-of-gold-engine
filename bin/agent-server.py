@@ -2020,6 +2020,34 @@ def load_memory_index(agent: str) -> str:
 # Character budget for the facts block injected into the system prompt.
 STORED_FACTS_CHAR_BUDGET = 6000
 
+# Per-turn memory retrieval (issue #32). Subjects of the facts injected at spawn
+# time, per agent, so the per-turn block does not repeat them.
+SPAWN_FACT_SUBJECTS: Dict[str, set] = {}
+PER_TURN_MEMORY_TOP_K = 5
+PER_TURN_MEMORY_CHAR_CAP = 1500
+PER_TURN_MEMORY_QUERY_CHARS = 1000
+
+
+def build_per_turn_memory_block(agent: str, query_text: str) -> str:
+    """Return a `[relevant memory]` block for this turn's inbound text, or "".
+
+    Never raises: any retrieval failure is logged and the turn proceeds without
+    the block. Blocking sqlite/embedding work; call via asyncio.to_thread.
+    """
+    try:
+        import memory_retrieval
+        db_path = WORKSPACE_ROOT / "data" / "memory" / "memory.db"
+        return memory_retrieval.relevant_memory_block(
+            db_path,
+            (query_text or "")[:PER_TURN_MEMORY_QUERY_CHARS],
+            exclude_subjects=SPAWN_FACT_SUBJECTS.get(agent, set()),
+            k=PER_TURN_MEMORY_TOP_K,
+            char_cap=PER_TURN_MEMORY_CHAR_CAP,
+        )
+    except Exception as e:
+        log.warning(f"Per-turn memory retrieval failed for {agent}: {e}")
+        return ""
+
 
 def _fact_subject_key(subject: str) -> str:
     """Normalized subject used to dedup DB rows against candidate-file lines."""
@@ -2114,6 +2142,10 @@ def load_stored_facts(agent: str = "", limit: int = 50, char_budget: int = STORE
                         pass
             except Exception as e:
                 log.warning(f"Failed to load memory candidates: {e}")
+
+    if agent:
+        # Per-turn retrieval skips facts the agent already has in its system prompt.
+        SPAWN_FACT_SUBJECTS[agent] = set(seen_subjects)
 
     if not facts_lines:
         return ""
@@ -3800,6 +3832,24 @@ async def process_agent_queue(agent: str):
                     f"the whole batch before assuming it's a normal "
                     f"back-and-forth.]"
                 )
+
+        # Per-turn memory retrieval (issue #32): the agent process is persistent,
+        # so the spawn-time facts block goes stale. Look up facts/episodes for
+        # this turn's text and put them just ahead of the messages. Opt out
+        # with "per_turn_memory": false in config/agents.json. Never fails
+        # the turn.
+        if config.get("per_turn_memory", True):
+            try:
+                memory_block = await asyncio.to_thread(
+                    build_per_turn_memory_block,
+                    agent,
+                    "\n".join(str(m["content"] or "") for m in messages),
+                )
+            except Exception as e:
+                log.warning(f"Per-turn memory retrieval failed for {agent}: {e}")
+                memory_block = ""
+            if memory_block:
+                formatted_parts.append(memory_block)
 
         for msg in messages:
             timestamp = msg["created_at"]
