@@ -5077,7 +5077,7 @@ async def graceful_shutdown(sig):
 
 def _log_claude_cli():
     """Resolve the claude CLI once at startup. Never raises: relay/health
-    must stay up even if it is missing (spawn sites raise the same message)."""
+    must stay up even if it is missing (claude_bin() falls back to the configured value)."""
     path = resolve_claude_bin()
     if path is None:
         log.error(missing_message())

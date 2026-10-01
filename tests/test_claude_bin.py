@@ -37,8 +37,10 @@ def test_missing_returns_none_and_message_names_env(monkeypatch):
     assert claude_bin.resolve_claude_bin() is None
     msg = claude_bin.missing_message()
     assert "CLAUDE_BIN" in msg and "/nonexistent/claude" in msg and "/some/path" in msg
-    with pytest.raises(FileNotFoundError, match="CLAUDE_BIN"):
-        claude_bin.claude_bin()
+    # Unresolvable: falls back to the configured value (spawn fails where it
+    # always did), after printing the legible message once.
+    monkeypatch.setattr(claude_bin, "_warned", False)
+    assert claude_bin.claude_bin() == "/nonexistent/claude"
 
 
 def test_missing_on_path(monkeypatch):

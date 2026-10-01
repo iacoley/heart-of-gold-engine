@@ -31,9 +31,24 @@ def missing_message() -> str:
     )
 
 
+_warned = False
+
+
 def claude_bin() -> str:
-    """Like resolve_claude_bin() but raises FileNotFoundError with a clear message."""
+    """Resolved path of the claude CLI for argv[0].
+
+    If it can't be resolved, logs the legible missing_message() once to
+    stderr and returns the configured value unchanged, so the spawn fails
+    exactly where it always did (and callers that mock the spawn, e.g.
+    tests on a host without the CLI, are unaffected). agent-server also
+    logs the same message as an ERROR at startup.
+    """
+    global _warned
     path = resolve_claude_bin()
-    if path is None:
-        raise FileNotFoundError(missing_message())
-    return path
+    if path is not None:
+        return path
+    if not _warned:
+        import sys
+        print(missing_message(), file=sys.stderr)
+        _warned = True
+    return configured_value()
