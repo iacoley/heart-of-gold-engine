@@ -38,6 +38,7 @@ from handoff import parse_handoff
 from outbox import add_pending
 from pass_filter import is_pass_sentinel
 from claude_bin import claude_bin, resolve_claude_bin, missing_message
+import model_compat
 
 # =============================================================================
 # Configuration
@@ -584,6 +585,13 @@ agent_spend_limit_notified: Dict[str, bool] = {}
 # real assistant content, not a specific string, so a third differently-
 # worded CLI failure doesn't repeat this a third time.
 agent_cli_error_blocked: Dict[str, bool] = {}
+# agent -> readable reason, set when start_agent_subprocess() refused to
+# spawn because the installed claude CLI is too old for the agent's model
+# (bin/model_compat.py). process_agent_queue answers queued messages with
+# this text instead of leaving them hanging. Cleared on a passing preflight.
+agent_spawn_refused: Dict[str, str] = {}
+# Dedup for the #signals alert (agent -> last alerted message).
+agent_spawn_refused_alerted: Dict[str, str] = {}
 agent_cli_error_notified: Dict[str, bool] = {}
 # Rate-limit override (2026-08-10, Ian's ask: "bugfixes regardless of
 # session limits, at my discretion"). An owner-set, auto-expiring bypass
@@ -2265,11 +2273,55 @@ def build_subprocess_env(agent: str) -> dict:
     return env
 
 
+async def _preflight_cli_model(agent: str, config: dict) -> bool:
+    """Check the installed claude CLI is new enough for the agent's model.
+    Returns True to spawn, False to refuse. Never raises. Called on every
+    (re)spawn: startup, /reload, restart, hot-register. The version is
+    cached in model_compat, so this is a stat, not a subprocess, per call."""
+    model = config.get("model", "sonnet")
+    try:
+        status, msg = await asyncio.to_thread(model_compat.check_model, model)
+    except Exception as e:
+        log.warning(f"CLI/model preflight for {agent} failed ({e}); allowing spawn")
+        return True
+    if status == "ok":
+        agent_spawn_refused.pop(agent, None)
+        agent_spawn_refused_alerted.pop(agent, None)
+        return True
+    if status == "unknown":
+        log.warning(f"{agent}: {msg}")
+        agent_spawn_refused.pop(agent, None)
+        return True
+    log.error(f"{agent}: REFUSING TO SPAWN -- {msg}")
+    agent_spawn_refused[agent] = (
+        f"I can't start right now: {msg}. Ian needs to upgrade the Claude "
+        f"CLI (or change my model in config/agents.json) and reload me."
+    )
+    if agent_spawn_refused_alerted.get(agent) != msg:
+        agent_spawn_refused_alerted[agent] = msg
+        signals_channel = (channels_config.get("channels", {}).get("signals", {}) or {}).get("id")
+        if signals_channel:
+            _spawn(post_to_discord(
+                agent, signals_channel,
+                f"-# 🚫 {agent} not started: {msg}. Other agents unaffected. "
+                f"<@{OWNER_DISCORD_ID}>",
+            ))
+    return False
+
+
 async def start_agent_subprocess(agent: str):
     """Start persistent Claude subprocess for agent"""
     config = agent_config.get(agent, {})
     if not config:
         log.error(f"No config found for agent: {agent}")
+        return
+
+    if not await _preflight_cli_model(agent, config):
+        # Refused: no subprocess. State stays IDLE (not ERROR_RECOVERY,
+        # which would make process_agent_queue return silently) so queued
+        # messages reach the refusal reply in process_agent_queue.
+        agent_processes.pop(agent, None)
+        agent_states[agent] = "IDLE"
         return
 
     session_id = await get_or_create_session(agent)
@@ -3766,6 +3818,25 @@ async def process_agent_queue(agent: str):
         )
         await db.commit()
 
+        # Refused spawn (CLI too old for the model, see
+        # _preflight_cli_model): answer instead of hanging on a
+        # subprocess that doesn't exist.
+        if agent in agent_spawn_refused and agent not in agent_processes:
+            refusal = agent_spawn_refused[agent]
+            if target_channel_id != "0":
+                await post_to_discord(agent, target_channel_id, refusal)
+            await db.execute(
+                f"""
+                UPDATE message_queue
+                SET processed = ?, response = ?, processed_at = CURRENT_TIMESTAMP
+                WHERE message_id IN ({','.join('?' * len(message_ids))})
+                """,
+                (STATUS_COMPLETE, refusal, *message_ids)
+            )
+            await db.commit()
+            log.error(f"{agent}: replied with spawn-refusal to {len(message_ids)} message(s)")
+            return
+
         # Format batch
         channel_id = target_channel_id
         # Explicit channel header (2026-08-06) — the actual root cause
@@ -5082,11 +5153,8 @@ def _log_claude_cli():
     if path is None:
         log.error(missing_message())
         return
-    try:
-        out = subprocess.run([path, "--version"], capture_output=True,
-                             text=True, timeout=15).stdout.strip()
-    except Exception as e:
-        out = f"--version failed: {e}"
+    # Shares model_compat's cache, so the per-agent preflight doesn't re-run it.
+    _, _, out = model_compat.get_cli_version()
     log.info("claude CLI: %s (%s)", path, out)
 
 
