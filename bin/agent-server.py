@@ -2540,6 +2540,24 @@ async def post_to_discord(agent: str, channel_id: str, content: str, reply_to: O
         )
         return None
 
+    # Same structural reasoning as the empty-content guard just above, now
+    # covering the other way a "stay silent" turn leaks: a literal PASS
+    # sentinel or a silence-announcement ("Not my mention", etc.) that
+    # survives as non-empty text. The live-turn path (process_agent_queue,
+    # ~line 3859) and crash_recovery()'s retry loop already pre-filter on
+    # is_silence_announcement() before calling this function — but the
+    # 2026-10-01 00:48 UTC incident (task-1790732906) happened precisely
+    # because crash_recovery() had its own independent post call that
+    # forgot to. Belt-and-suspenders: put the check here too, in the one
+    # function every posting path funnels through, so a future third
+    # caller that forgets to pre-filter still can't leak PASS to Discord.
+    if is_silence_announcement(content):
+        log.info(
+            f"post_to_discord: suppressing PASS/silence-announcement content for "
+            f"{agent} in {channel_id} (silence discipline, task-1790732906)"
+        )
+        return None
+
     # Get agent's Discord token, fallback to primary agent
     token = AGENT_TOKENS.get(agent)
     if not token:
@@ -4118,13 +4136,40 @@ async def crash_recovery():
         # so this stops recurring; genuinely retryable rows (real response
         # text, just never confirmed posted) still go through below as before.
         empty = [m for m in unposted if not m["response"]]
-        retryable = [m for m in unposted if m["response"]]
+        # PASS-sentinel / silence-announcement rows are a legitimate "stay
+        # silent" turn that never got to mark itself posted (e.g. the
+        # process restarted between generating the response and confirming
+        # the post — see the 2026-10-01 00:48 UTC incident: 17 bare PASS
+        # rows leaked into #agent-chat because this loop reposted them with
+        # no screening). The live-turn posting path gates every post on
+        # is_silence_announcement() before calling post_to_discord(); this
+        # recovery loop is the only other caller of post_to_discord() for
+        # these rows and must apply the same gate. Mark them STATUS_SKIPPED
+        # like the empty bucket above, so they don't get reposted here and
+        # don't get rediscovered on every future startup.
+        pass_sentinel = [
+            m for m in unposted
+            if m["response"] and is_silence_announcement(m["response"])
+        ]
+        pass_sentinel_ids = {m["message_id"] for m in pass_sentinel}
+        retryable = [
+            m for m in unposted
+            if m["response"] and m["message_id"] not in pass_sentinel_ids
+        ]
 
         if empty:
             log.info(f"Marking {len(empty)} empty-response stale rows as skipped (never postable, pre-2026-08-11 mid-turn-kill artifacts)")
             await db.executemany(
                 "UPDATE message_queue SET processed = ? WHERE message_id = ?",
                 [(STATUS_SKIPPED, m["message_id"]) for m in empty]
+            )
+            await db.commit()
+
+        if pass_sentinel:
+            log.info(f"Marking {len(pass_sentinel)} PASS-sentinel/silence-announcement stale rows as skipped (legitimate stay-silent turns, never to be posted)")
+            await db.executemany(
+                "UPDATE message_queue SET processed = ? WHERE message_id = ?",
+                [(STATUS_SKIPPED, m["message_id"]) for m in pass_sentinel]
             )
             await db.commit()
 

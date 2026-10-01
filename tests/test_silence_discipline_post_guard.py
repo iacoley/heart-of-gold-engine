@@ -1,4 +1,5 @@
-"""post_to_discord must never let blank content reach the Discord API.
+"""post_to_discord must never let blank or PASS-sentinel content reach the
+Discord API.
 
 Real incident, 2026-09-04: two visible blank messages (content == "")
 landed in #general at 00:03:40 and 00:03:41, caught by Ian, not by any
@@ -17,6 +18,14 @@ common failure was fixing the model's judgment instead of verifying the
 result before it left the process. This guard sits in post_to_discord
 itself — every posting path funnels through it, so it can't be bypassed
 by a caller nobody thought to check.
+
+2026-10-01 00:48 UTC incident (task-1790732906): 17 bare PASS-sentinel
+rows leaked into #agent-chat because crash_recovery()'s retry loop had
+its own independent post_to_discord() call that forgot to pre-filter on
+is_silence_announcement() the way the live-turn path does. Rather than
+trust every future caller to remember that pre-filter, the same check
+was added here too — defense-in-depth in the one function every posting
+path funnels through, same shape as the whitespace/empty guard above.
 """
 
 import pytest
@@ -55,6 +64,29 @@ class _ExplodingSession:
 async def test_blank_content_is_never_posted(agent_server, monkeypatch, blank):
     monkeypatch.setattr(agent_server, "http_session", _ExplodingSession())
     result = await agent_server.post_to_discord("Marvin", "chan-1", blank)
+    assert result is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pass_content",
+    [
+        "PASS",
+        "PASS.",
+        "**PASS**",
+        "Nothing new. PASS",
+        "Already flagged and resolved with Zero last round. Nothing new here.PASS",
+        "Not my mention, sitting this one out.",
+    ],
+)
+async def test_pass_sentinel_content_is_never_posted(agent_server, monkeypatch, pass_content):
+    """Defense-in-depth for task-1790732906: a PASS sentinel or silence
+    announcement must never reach the Discord API, regardless of which
+    caller handed it to post_to_discord() — this is the same guard shape
+    as the blank-content case above, just keyed on
+    is_silence_announcement() instead of an empty/whitespace check."""
+    monkeypatch.setattr(agent_server, "http_session", _ExplodingSession())
+    result = await agent_server.post_to_discord("Marvin", "chan-1", pass_content)
     assert result is None
 
 
