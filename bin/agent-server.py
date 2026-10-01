@@ -2956,6 +2956,21 @@ async def write_streaming_response(message_ids: List[str], text: str) -> None:
         log.warning(f"streaming response write failed: {e}")
 
 
+# Background-subagent follow-up turns (issue #34). When the parent launches a
+# background Task/Agent, Claude Code's persistent stream-json process emits
+# one `result` for the launching turn and, once the task_notification lands,
+# starts a SECOND turn on its own (system `init` -> assistant -> `result`)
+# with no new stdin message. read_agent_response() used to stop at the first
+# `result`, leaving that follow-up in the pipe to be read as the start of the
+# NEXT message's reply (an off-by-one that never self-heals).
+# Grace: how long to wait for a follow-up turn after a result when a
+# backgrounded task already finished (follow-up starts within ~1s).
+BG_FOLLOWUP_GRACE_SEC = float(os.environ.get("AGENT_BG_FOLLOWUP_GRACE_SEC", "15"))
+# Cap: how long to wait for a still-running backgrounded task's follow-up.
+BG_FOLLOWUP_MAX_WAIT_SEC = float(os.environ.get("AGENT_BG_FOLLOWUP_MAX_WAIT_SEC", "600"))
+_BG_TERMINAL_STATUSES = {"completed", "failed", "killed", "stopped", "cancelled", "error"}
+
+
 async def read_agent_response(
     agent: str, channel_id: str, message_ids: Optional[List[str]] = None
 ) -> tuple[str, Dict]:
@@ -3026,6 +3041,14 @@ async def read_agent_response(
     text_streamed_this_turn = False
     last_discord_msg_id = None
 
+    # Background-subagent tracking (issue #34), see BG_FOLLOWUP_* above.
+    bg_outstanding: set = set()       # backgrounded task_ids started, not yet finished
+    bg_notified_unanswered = False    # a bg task finished since the last result
+    followup_deadline = None          # loop-time deadline while awaiting a follow-up turn
+    prior_segments: List[str] = []    # already-posted earlier segments of this read
+    agg_usage = {"input_tokens": 0, "output_tokens": 0, "duration_ms": 0}
+    loop = asyncio.get_running_loop()
+
     async def flush_pending_text():
         nonlocal pending_interim_text, text_streamed_this_turn, last_discord_msg_id
         if pending_interim_text and stream_to_channel and channel_id != "0":
@@ -3056,7 +3079,20 @@ async def read_agent_response(
 
     try:
         while True:
-            line = await proc.stdout.readline()
+            if followup_deadline is None:
+                line = await proc.stdout.readline()
+            else:
+                try:
+                    line = await asyncio.wait_for(
+                        proc.stdout.readline(),
+                        timeout=max(followup_deadline - loop.time(), 0.01),
+                    )
+                except asyncio.TimeoutError:
+                    log.warning(
+                        f"{agent}: no background-task follow-up turn arrived "
+                        f"(outstanding={sorted(bg_outstanding)}); returning what we have"
+                    )
+                    break
             if not line:
                 break
 
@@ -3114,11 +3150,33 @@ async def read_agent_response(
             # Claude Code stream-json output: each turn emits one or more
             # `assistant` events with content blocks (thinking/text/tool_use),
             # then a single `result` event closes the turn.
+            if event_type == "system":
+                subtype = event.get("subtype")
+                task_id = event.get("task_id")
+                if subtype == "task_started" and task_id and event.get("is_backgrounded"):
+                    bg_outstanding.add(task_id)
+                elif subtype == "task_notification" and task_id:
+                    bg_outstanding.discard(task_id)
+                    bg_notified_unanswered = True
+                elif subtype == "task_updated" and task_id:
+                    status = (event.get("patch") or {}).get("status")
+                    if status in _BG_TERMINAL_STATUSES and task_id in bg_outstanding:
+                        bg_outstanding.discard(task_id)
+                        bg_notified_unanswered = True
+                continue
+
             if event_type == "assistant":
                 parent_id = event.get("parent_tool_use_id") or (event.get("message") or {}).get("parent_tool_use_id")
                 if parent_id:
                     # Ignore nested subagent output from leaking into top-level Discord output
                     continue
+                # A top-level assistant event means the follow-up turn (if we
+                # were waiting for one) has started: stop the wait clock.
+                if followup_deadline is not None:
+                    followup_deadline = None
+                    # Notifications seen while waiting are what triggered
+                    # this follow-up turn; they are answered by it.
+                    bg_notified_unanswered = False
 
                 message = event.get("message", {}) or {}
                 got_text = False
@@ -3231,6 +3289,8 @@ async def read_agent_response(
 
                 if got_text:
                     cleaned = THINKING_BLOCK_RE.sub("", final_text)
+                    if prior_segments:
+                        cleaned = "\n\n".join(prior_segments + [cleaned])
                     await write_streaming_response(msg_ids, cleaned)
 
             elif event_type == "rate_limit_event":
@@ -3256,10 +3316,17 @@ async def read_agent_response(
                 # last_assistant_usage instead for anything context-size
                 # related.
                 usage = event.get("usage", {}) or {}
+                # Per-result usage/duration are per segment; sum them across
+                # a background follow-up so cost_events isn't undercounted.
+                # total_cost_usd is session-cumulative on every result, so
+                # the LAST one is used as-is (summing it would double count).
+                agg_usage["input_tokens"] += usage.get("input_tokens", 0)
+                agg_usage["output_tokens"] += usage.get("output_tokens", 0)
+                agg_usage["duration_ms"] += event.get("duration_ms", 0) or 0
                 metadata = {
                     "session_id": event.get("session_id"),
-                    "input_tokens": usage.get("input_tokens", 0),
-                    "output_tokens": usage.get("output_tokens", 0),
+                    "input_tokens": agg_usage["input_tokens"],
+                    "output_tokens": agg_usage["output_tokens"],
                     # Real per-turn context size — last individual
                     # assistant event's own usage, not this result event's
                     # (likely-aggregated) figures. Falls back to this
@@ -3273,7 +3340,7 @@ async def read_agent_response(
                         "cache_creation_input_tokens", usage.get("cache_creation_input_tokens", 0)
                     ),
                     "total_cost_usd": event.get("total_cost_usd", 0.0),
-                    "duration_ms": event.get("duration_ms", 0),
+                    "duration_ms": agg_usage["duration_ms"],
                     "is_error": event.get("is_error", False),
                     "model": active_model or event.get("model"),
                 }
@@ -3306,6 +3373,36 @@ async def read_agent_response(
                     metadata["cli_error_blocked"] = True
                     metadata["cli_error_text"] = final_text
                     final_text = ""
+
+                # Background subagent still running, or just finished and
+                # about to trigger a follow-up turn (issue #34): this result
+                # is only the interim reply. Post it now (plain, like the
+                # caller would), reset per-segment state, and keep reading
+                # until the follow-up turn's result. Errors never wait.
+                if (
+                    (bg_outstanding or bg_notified_unanswered)
+                    and not event.get("is_error")
+                    and not metadata.get("spend_limit_blocked")
+                ):
+                    seg_final = THINKING_BLOCK_RE.sub("", final_text).strip()
+                    if seg_final and channel_id != "0" and not is_silence_announcement(seg_final):
+                        msg_id = await post_to_discord(agent, channel_id, seg_final)
+                        if msg_id:
+                            last_discord_msg_id = msg_id
+                    if seg_final:
+                        prior_segments.append(seg_final)
+                    final_text = ""
+                    pending_interim_text = None
+                    text_streamed_this_turn = False
+                    bg_notified_unanswered = False
+                    followup_deadline = loop.time() + (
+                        BG_FOLLOWUP_MAX_WAIT_SEC if bg_outstanding else BG_FOLLOWUP_GRACE_SEC
+                    )
+                    log.info(
+                        f"{agent}: result with background task(s) "
+                        f"(outstanding={sorted(bg_outstanding)}); posted interim, awaiting follow-up"
+                    )
+                    continue
                 break
 
     except Exception as e:
@@ -3328,6 +3425,12 @@ async def read_agent_response(
         pending_final = ""
     else:
         pending_final = final_text
+
+    # Earlier background-follow-up segments were already posted; the caller
+    # still gets the full text (history, context_box, voice scoring) but
+    # pending_final stays only the unposted remainder of the last segment.
+    if prior_segments:
+        final_text = "\n\n".join(prior_segments + ([final_text] if final_text else []))
 
     agent_states[agent] = "IDLE"
     _write_mechanical_status(agent, None)
