@@ -69,6 +69,7 @@ and still work standalone; they're just no longer what decides
 from __future__ import annotations
 
 import asyncio
+from claude_bin import claude_bin
 import json
 import logging
 import os
@@ -329,7 +330,7 @@ async def judge_voice_presence(text: str) -> Optional[dict]:
         return None
     try:
         proc = await asyncio.create_subprocess_exec(
-            "claude", "-p", _judge_prompt(text),
+            claude_bin(), "-p", _judge_prompt(text),
             "--model", JUDGE_MODEL,
             "--max-turns", "1",
             "--output-format", "stream-json",
@@ -413,7 +414,7 @@ async def rewrite_for_voice(text: str, reason: str) -> Optional[str]:
         return None
     try:
         proc = await asyncio.create_subprocess_exec(
-            "claude", "-p", _rewrite_prompt(text, reason),
+            claude_bin(), "-p", _rewrite_prompt(text, reason),
             "--model", JUDGE_MODEL,
             "--max-turns", "1",
             "--output-format", "stream-json",

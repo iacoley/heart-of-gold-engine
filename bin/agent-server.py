@@ -37,6 +37,7 @@ import auth_guard
 from handoff import parse_handoff
 from outbox import add_pending
 from pass_filter import is_pass_sentinel
+from claude_bin import claude_bin, resolve_claude_bin, missing_message
 
 # =============================================================================
 # Configuration
@@ -1745,7 +1746,7 @@ async def classify_topic_change(previous_text: str, new_text: str) -> Optional[b
         return None
     try:
         proc = await asyncio.create_subprocess_exec(
-            "claude", "-p", prompt,
+            claude_bin(), "-p", prompt,
             "--model", "haiku",
             "--max-turns", "1",
             "--output-format", "stream-json",
@@ -2207,6 +2208,7 @@ def load_onboarding_prompt(agent: str) -> str:
 INERT_ENV_ALLOWLIST = (
     # POSIX baseline
     "PATH", "HOME", "USER", "SHELL", "TERM", "LANG", "LC_ALL", "TMPDIR",
+    "CLAUDE_BIN",  # path to the claude CLI (not a secret); see bin/claude_bin.py
     "PAGER", "LESS", "XDG_CONFIG_HOME",
     # Karakos operational config
     "WORKSPACE_ROOT", "KARAKOS_ENV_FILE", "KARAKOS_LOG_DIR", "AGENT_SERVER_PORT",
@@ -2325,7 +2327,7 @@ async def start_agent_subprocess(agent: str):
 
     # Build command
     cmd = [
-        "claude", "-p",
+        claude_bin(), "-p",
         "--input-format", "stream-json",
         "--output-format", "stream-json",
         "--model", config.get("model", "sonnet"),
@@ -5073,12 +5075,28 @@ async def graceful_shutdown(sig):
 # Server Startup
 # =============================================================================
 
+def _log_claude_cli():
+    """Resolve the claude CLI once at startup. Never raises: relay/health
+    must stay up even if it is missing (claude_bin() falls back to the configured value)."""
+    path = resolve_claude_bin()
+    if path is None:
+        log.error(missing_message())
+        return
+    try:
+        out = subprocess.run([path, "--version"], capture_output=True,
+                             text=True, timeout=15).stdout.strip()
+    except Exception as e:
+        out = f"--version failed: {e}"
+    log.info("claude CLI: %s (%s)", path, out)
+
+
 async def startup(app):
     """Initialize server on startup"""
     global http_session
 
     _acquire_singleton_lock("agent-server")
     log.info("Starting Karakos Agent Server")
+    _log_claude_cli()
 
     # Initialize HTTP session
     http_session = aiohttp.ClientSession()

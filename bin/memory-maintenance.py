@@ -13,6 +13,7 @@ Called by scheduler daily at 3 AM.
 """
 
 import json
+from claude_bin import claude_bin
 import logging
 import os
 import sqlite3
@@ -227,7 +228,7 @@ SCORE_FAILURE_IMPORTANCE = IMPORTANCE_CUTOFF + 1.0
 def _score_importance_once(prompt: str, timeout: float) -> float | None:
     try:
         result = subprocess.run(
-            ["claude", "-p", prompt, "--model", "haiku", "--max-turns", "1"],
+            [claude_bin(), "-p", prompt, "--model", "haiku", "--max-turns", "1"],
             capture_output=True,
             text=True,
             timeout=timeout
@@ -585,7 +586,7 @@ Excerpt: {summary}"""
 
     try:
         result = subprocess.run(
-            ["claude", "-p", prompt, "--model", "haiku", "--max-turns", "1"],
+            [claude_bin(), "-p", prompt, "--model", "haiku", "--max-turns", "1"],
             capture_output=True,
             text=True,
             timeout=20

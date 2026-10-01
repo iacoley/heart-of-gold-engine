@@ -9,6 +9,7 @@ Adapters:
 """
 
 import asyncio
+from claude_bin import claude_bin
 import discord
 import fcntl
 import functools
@@ -1685,7 +1686,7 @@ class DiscordAdapter(discord.Client):
         for attempt in range(2):
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    "claude", "-p",
+                    claude_bin(), "-p",
                     "--model", "haiku",
                     "--max-turns", "1",
                     "--dangerously-skip-permissions",
