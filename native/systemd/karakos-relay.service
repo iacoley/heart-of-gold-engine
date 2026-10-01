@@ -22,6 +22,9 @@ Wants=network-online.target
 Wants=karakos-agent-server.service
 
 [Service]
+# Same as karakos-agent-server.service: make the claude CLI dependency
+# explicit for anything this unit spawns (relay scorer, scheduled jobs).
+Environment=CLAUDE_BIN=/usr/bin/claude
 Type=simple
 User=karakos
 Group=karakos
