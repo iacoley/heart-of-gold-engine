@@ -361,3 +361,99 @@ class TestMemoryRemember:
     def test_recall_still_errors_when_db_missing(self, tools_server):
         result = tools_server.handle_core_tool("memory", {"action": "recall", "query": "anything"})
         assert result == {"error": "Memory database not found"}
+
+
+class TestMemoryUpsertForgetUpdate:
+    def _rows(self, tmp_path):
+        import sqlite3
+        conn = sqlite3.connect(str(tmp_path / "data" / "memory" / "memory.db"))
+        rows = conn.execute("SELECT subject, content, domain, confidence FROM facts ORDER BY id").fetchall()
+        conn.close()
+        return rows
+
+    def test_remember_same_subject_domain_upserts(self, tools_server, tmp_path):
+        r1 = tools_server.handle_core_tool(
+            "memory", {"action": "remember", "subject": "Ian", "content": "v1"})
+        r2 = tools_server.handle_core_tool(
+            "memory", {"action": "remember", "subject": "Ian", "content": "v2", "confidence": 0.5})
+        assert r1["id"] == r2["id"]
+        assert r2["status"] == "updated"
+        assert self._rows(tmp_path) == [("Ian", "v2", "general", 0.5)]
+
+    def test_same_subject_different_domain_is_separate(self, tools_server, tmp_path):
+        for d in ("a", "b"):
+            tools_server.handle_core_tool(
+                "memory", {"action": "remember", "subject": "Ian", "content": d, "domain": d})
+        assert len(self._rows(tmp_path)) == 2
+
+    def test_forget_by_subject_and_domain(self, tools_server, tmp_path):
+        for d in ("a", "b"):
+            tools_server.handle_core_tool(
+                "memory", {"action": "remember", "subject": "Ian", "content": d, "domain": d})
+        res = tools_server.handle_core_tool(
+            "memory", {"action": "forget", "subject": "Ian", "domain": "a"})
+        assert res["deleted"] == 1
+        assert [r[2] for r in self._rows(tmp_path)] == ["b"]
+        res = tools_server.handle_core_tool("memory", {"action": "forget", "subject": "Ian"})
+        assert res["deleted"] == 1
+        assert self._rows(tmp_path) == []
+
+    def test_forget_requires_subject(self, tools_server):
+        assert "error" in tools_server.handle_core_tool("memory", {"action": "forget", "subject": " "})
+
+    def test_update_changes_content_keeps_confidence(self, tools_server, tmp_path):
+        tools_server.handle_core_tool(
+            "memory", {"action": "remember", "subject": "X", "content": "old", "confidence": 0.9})
+        res = tools_server.handle_core_tool(
+            "memory", {"action": "update", "subject": "X", "content": "new"})
+        assert res["status"] == "updated"
+        assert self._rows(tmp_path) == [("X", "new", "general", 0.9)]
+
+    def test_update_missing_fact_errors(self, tools_server):
+        res = tools_server.handle_core_tool(
+            "memory", {"action": "update", "subject": "Nope", "content": "x"})
+        assert "error" in res
+
+    def test_remember_collapses_preexisting_duplicates(self, tools_server, tmp_path):
+        tools_server.handle_core_tool(
+            "memory", {"action": "remember", "subject": "D", "content": "1"})
+        import sqlite3
+        conn = sqlite3.connect(str(tmp_path / "data" / "memory" / "memory.db"))
+        conn.execute("INSERT INTO facts (subject, content, domain) VALUES ('D','2','general')")
+        conn.commit()
+        conn.close()
+        tools_server.handle_core_tool(
+            "memory", {"action": "remember", "subject": "D", "content": "3"})
+        assert [r[1] for r in self._rows(tmp_path)] == ["3"]
+
+    def test_connection_closed_on_read_and_write(self, tools_server, tmp_path, monkeypatch):
+        import sqlite3
+        opened = []
+        real = sqlite3.connect
+
+        class Spy:
+            def __init__(self, c):
+                self._c = c
+                self.closed = False
+                opened.append(self)
+
+            def __getattr__(self, n):
+                return getattr(self._c, n)
+
+            @property
+            def row_factory(self):
+                return self._c.row_factory
+
+            @row_factory.setter
+            def row_factory(self, v):
+                self._c.row_factory = v
+
+            def close(self):
+                self.closed = True
+                self._c.close()
+
+        monkeypatch.setattr(tools_server.sqlite3, "connect", lambda *a, **k: Spy(real(*a, **k)))
+        tools_server.handle_core_tool("memory", {"action": "remember", "subject": "S", "content": "c"})
+        tools_server.handle_core_tool("memory", {"action": "facts", "query": "S"})
+        tools_server.handle_core_tool("memory", {"action": "remember", "subject": " ", "content": "c"})
+        assert opened and all(s.closed for s in opened)
