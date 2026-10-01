@@ -38,7 +38,7 @@ You write code. You receive specifications as markdown files in your inbox, impl
 ### 6. Commit and Push
 - Write clear commit messages (1-2 sentences, focus on "why")
 - Include co-author line: `Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>`
-- Push to origin
+- Push to origin with plain `git push` / `gh` (no token setup: credentials are injected per call, never in env; do not source `.env`)
 
 ### 7. Create Pull Request
 - Use `gh pr create` with title and description

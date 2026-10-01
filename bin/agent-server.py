@@ -2128,7 +2128,7 @@ INERT_ENV_ALLOWLIST = (
     "PATH", "HOME", "USER", "SHELL", "TERM", "LANG", "LC_ALL", "TMPDIR",
     "PAGER", "LESS", "XDG_CONFIG_HOME",
     # Karakos operational config
-    "WORKSPACE_ROOT", "KARAKOS_LOG_DIR", "AGENT_SERVER_PORT",
+    "WORKSPACE_ROOT", "KARAKOS_ENV_FILE", "KARAKOS_LOG_DIR", "AGENT_SERVER_PORT",
     "AGENT_SERVER_URL", "AGENT_BRIDGE_HOST", "OWNER_DISCORD_ID",
     "OWNER_NAME", "SYSTEM_NAME", "KARAKOS_DISCORD_API_BASE",
     "COST_DAILY_LIMIT", "COST_MONTHLY_LIMIT", "COST_WARNING_THRESHOLD",
@@ -2168,6 +2168,17 @@ def build_subprocess_env(agent: str) -> dict:
         if key in os.environ
     }
     env["AGENT_NAME"] = agent
+    # Call-time GitHub credentials (issue #30): no token in env. git finds
+    # a credential helper via GIT_CONFIG_* (inherited by every git, incl.
+    # worktrees and in-process subagents), and the gh shim dir leads PATH.
+    # Both read the token fresh from config/.env per call.
+    bin_dir = Path(__file__).resolve().parent
+    env["GIT_CONFIG_COUNT"] = "1"
+    env["GIT_CONFIG_KEY_0"] = "credential.https://github.com.helper"
+    env["GIT_CONFIG_VALUE_0"] = str(bin_dir / "git-credential-karakos")
+    env["PATH"] = os.pathsep.join(
+        p for p in (str(bin_dir / "shims"), env.get("PATH", "")) if p
+    )
     return env
 
 
