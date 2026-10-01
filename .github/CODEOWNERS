@@ -1,5 +1,21 @@
-# Every path in this repo requires a review from the owner before merge.
+# Code owners for heart-of-gold-engine.
+#
 # GitHub only *enforces* this when "Require review from Code Owners" is
-# enabled in a branch protection rule or ruleset on main — a repo-admin
-# setting. Until then this file still auto-requests Ian's review on every PR.
+# enabled in a branch protection rule or ruleset on main (repo-admin
+# setting). Until then it auto-requests review but does not block merging.
+#
+# Baseline: every path needs the owner's review.
 *       @iacoley
+
+# Tier 1 (config/protected-paths.json "tier1_protected"). Listed explicitly so
+# they stay owner-reviewed even if the catch-all above is ever narrowed.
+# tests/test_codeowners_sync.py fails if this list drifts from the JSON.
+/system/            @iacoley
+/config/            @iacoley
+/bin/agent-server.py    @iacoley
+/bin/relay.py           @iacoley
+/bin/entrypoint.sh      @iacoley
+/bin/scheduler.py       @iacoley
+/.karakos/          @iacoley
+/Dockerfile         @iacoley
+/config/protected-paths.json    @iacoley
