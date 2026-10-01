@@ -38,6 +38,7 @@ from handoff import parse_handoff
 from outbox import add_pending
 from pass_filter import is_pass_sentinel
 from claude_bin import claude_bin, resolve_claude_bin, missing_message
+import model_compat
 
 # =============================================================================
 # Configuration
@@ -584,6 +585,16 @@ agent_spend_limit_notified: Dict[str, bool] = {}
 # real assistant content, not a specific string, so a third differently-
 # worded CLI failure doesn't repeat this a third time.
 agent_cli_error_blocked: Dict[str, bool] = {}
+# agent -> readable reason, set when start_agent_subprocess() refused to
+# spawn because the installed claude CLI is too old for the agent's model
+# (bin/model_compat.py). process_agent_queue answers queued messages with
+# this text instead of leaving them hanging. Cleared on a passing preflight.
+agent_spawn_refused: Dict[str, str] = {}
+# Dedup for the #signals alert (agent -> last alerted message).
+agent_spawn_refused_alerted: Dict[str, str] = {}
+# agent -> most recent preflight failure text (set whether or not a live
+# subprocess was kept), so reload/restart callers can surface the reason.
+agent_preflight_msg: Dict[str, str] = {}
 agent_cli_error_notified: Dict[str, bool] = {}
 # Rate-limit override (2026-08-10, Ian's ask: "bugfixes regardless of
 # session limits, at my discretion"). An owner-set, auto-expiring bypass
@@ -1678,7 +1689,9 @@ async def compact_session(agent: str, reason: str) -> bool:
         (agent,)
     )
     await db.commit()
-    await restart_agent(agent)
+    if not await restart_agent(agent) and agent_preflight_msg.get(agent):
+        log.error(f"{agent} compaction restart skipped by CLI/model preflight ({reason})")
+        return False
     log.info(f"{agent} compacted and restarted with a fresh session ({reason})")
     return True
 
@@ -2265,11 +2278,75 @@ def build_subprocess_env(agent: str) -> dict:
     return env
 
 
+def _agent_proc_alive(agent: str) -> bool:
+    proc = agent_processes.get(agent)
+    return proc is not None and proc.returncode is None
+
+
+async def _preflight_cli_model(agent: str, config: dict, keep_running: bool = False) -> bool:
+    """Check the installed claude CLI is new enough for the agent's model.
+    Returns True to spawn, False to refuse. Never raises. Called on every
+    (re)spawn: startup, /reload, restart, hot-register. The version is
+    cached in model_compat, so this is a stat, not a subprocess, per call.
+
+    keep_running=True: the caller (reload/restart) has a live subprocess on
+    the previous, working model and runs this BEFORE killing it. On refusal
+    the live process is left untouched, agent_spawn_refused is NOT set (the
+    agent is still answering), and the reason is left in
+    agent_preflight_msg for the caller to surface."""
+    model = config.get("model", "sonnet")
+    try:
+        status, msg = await asyncio.to_thread(model_compat.check_model, model)
+    except Exception as e:
+        log.warning(f"CLI/model preflight for {agent} failed ({e}); allowing spawn")
+        return True
+    agent_preflight_msg.pop(agent, None)
+    if status == "ok":
+        agent_spawn_refused.pop(agent, None)
+        agent_spawn_refused_alerted.pop(agent, None)
+        return True
+    if status == "unknown":
+        log.warning(f"{agent}: {msg}")
+        agent_spawn_refused.pop(agent, None)
+        return True
+    agent_preflight_msg[agent] = msg
+    if keep_running:
+        log.error(
+            f"{agent}: SKIPPING reload/restart, leaving the running subprocess "
+            f"untouched -- {msg}"
+        )
+        agent_spawn_refused.pop(agent, None)
+    else:
+        log.error(f"{agent}: REFUSING TO SPAWN -- {msg}")
+        agent_spawn_refused[agent] = (
+            f"I can't start right now: {msg}. Ian needs to upgrade the Claude "
+            f"CLI (or change my model in config/agents.json) and reload me."
+        )
+    if agent_spawn_refused_alerted.get(agent) != msg:
+        agent_spawn_refused_alerted[agent] = msg
+        signals_channel = (channels_config.get("channels", {}).get("signals", {}) or {}).get("id")
+        if signals_channel:
+            _spawn(post_to_discord(
+                agent, signals_channel,
+                f"-# 🚫 {agent} not started: {msg}. Other agents unaffected. "
+                f"<@{OWNER_DISCORD_ID}>",
+            ))
+    return False
+
+
 async def start_agent_subprocess(agent: str):
     """Start persistent Claude subprocess for agent"""
     config = agent_config.get(agent, {})
     if not config:
         log.error(f"No config found for agent: {agent}")
+        return
+
+    if not await _preflight_cli_model(agent, config):
+        # Refused: no subprocess. State stays IDLE (not ERROR_RECOVERY,
+        # which would make process_agent_queue return silently) so queued
+        # messages reach the refusal reply in process_agent_queue.
+        agent_processes.pop(agent, None)
+        agent_states[agent] = "IDLE"
         return
 
     session_id = await get_or_create_session(agent)
@@ -2460,11 +2537,18 @@ async def restart_agent(agent: str):
     log.info(f"Restarting {agent}")
     lock = agent_locks.get(agent)
     async with (lock if lock else contextlib.nullcontext()):
+        # Preflight BEFORE killing: a refusal must not take down a working
+        # subprocess (and must not clear its session).
+        if _agent_proc_alive(agent) and not await _preflight_cli_model(
+            agent, agent_config.get(agent, {}), keep_running=True
+        ):
+            return False
         await kill_agent_subprocess(agent)
         await clear_session(agent)
         agent_last_cost.pop(agent, None)
         response_buffers[agent] = ""
         await start_agent_subprocess(agent)
+        return agent in agent_processes
 
 
 async def interrupt_agent(agent: str) -> Dict[str, Any]:
@@ -2524,10 +2608,19 @@ async def reload_agent(agent: str):
     log.info(f"Reloading {agent} (preserving session)")
     lock = agent_locks.get(agent)
     async with (lock if lock else contextlib.nullcontext()):
+        # Preflight BEFORE killing (see _preflight_cli_model keep_running):
+        # editing agents.json to a model the CLI is too old for, then
+        # reloading, must leave the working old-model subprocess running.
+        if _agent_proc_alive(agent) and not await _preflight_cli_model(
+            agent, agent_config.get(agent, {}), keep_running=True
+        ):
+            log.error(f"Reload of {agent} skipped; existing subprocess kept running")
+            return False
         await kill_agent_subprocess(agent)
         agent_last_cost.pop(agent, None)
         response_buffers[agent] = ""
         await start_agent_subprocess(agent)
+        return agent in agent_processes
 
 # =============================================================================
 # Cost Tracking
@@ -3766,6 +3859,25 @@ async def process_agent_queue(agent: str):
         )
         await db.commit()
 
+        # Refused spawn (CLI too old for the model, see
+        # _preflight_cli_model): answer instead of hanging on a
+        # subprocess that doesn't exist.
+        if agent in agent_spawn_refused and agent not in agent_processes:
+            refusal = agent_spawn_refused[agent]
+            if target_channel_id != "0":
+                await post_to_discord(agent, target_channel_id, refusal)
+            await db.execute(
+                f"""
+                UPDATE message_queue
+                SET processed = ?, response = ?, processed_at = CURRENT_TIMESTAMP
+                WHERE message_id IN ({','.join('?' * len(message_ids))})
+                """,
+                (STATUS_COMPLETE, refusal, *message_ids)
+            )
+            await db.commit()
+            log.error(f"{agent}: replied with spawn-refusal to {len(message_ids)} message(s)")
+            return
+
         # Format batch
         channel_id = target_channel_id
         # Explicit channel header (2026-08-06) — the actual root cause
@@ -4716,7 +4828,12 @@ async def handle_agent_reset(request):
     if agent not in agent_config:
         return web.json_response({"error": "Unknown agent"}, status=404)
 
-    await restart_agent(agent)
+    if not await restart_agent(agent) and agent_preflight_msg.get(agent):
+        return web.json_response(
+            {"error": f"Reset refused: {agent_preflight_msg[agent]}. "
+                      "The existing subprocess and session were left untouched."},
+            status=409,
+        )
     return web.json_response({"status": "reset"})
 
 
@@ -4745,7 +4862,14 @@ async def handle_agent_reload(request):
     if agent not in agent_config:
         return web.json_response({"error": "Unknown agent"}, status=404)
 
-    await reload_agent(agent)
+    if not await reload_agent(agent):
+        reason = agent_preflight_msg.get(agent)
+        if reason:
+            keep = " The existing subprocess was left running." if _agent_proc_alive(agent) else ""
+            return web.json_response(
+                {"error": f"Reload refused: {reason}.{keep}"}, status=409
+            )
+        return web.json_response({"error": "Reload failed: subprocess did not start"}, status=500)
     return web.json_response({"status": "reloaded"})
 
 
@@ -5082,11 +5206,8 @@ def _log_claude_cli():
     if path is None:
         log.error(missing_message())
         return
-    try:
-        out = subprocess.run([path, "--version"], capture_output=True,
-                             text=True, timeout=15).stdout.strip()
-    except Exception as e:
-        out = f"--version failed: {e}"
+    # Shares model_compat's cache, so the per-agent preflight doesn't re-run it.
+    _, _, out = model_compat.get_cli_version()
     log.info("claude CLI: %s (%s)", path, out)
 
 
