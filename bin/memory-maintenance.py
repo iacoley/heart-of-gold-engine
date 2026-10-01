@@ -38,6 +38,10 @@ MAX_EPISODES = int(os.environ.get("MEMORY_MAX_EPISODES", "15"))
 # deleted the same night it was written. Measured 2026-09-28: 96 episodes
 # created, 93 pruned in the same run, net 3 kept.
 MEMORY_PRUNE_GRACE_DAYS = float(os.environ.get("MEMORY_PRUNE_GRACE_DAYS", "7"))
+# How many past UTC days (yesterday included) the nightly run will look back
+# for message files that have not been processed yet, so a missed run does
+# not permanently lose a day.
+LOOKBACK_DAYS = int(os.environ.get("MEMORY_LOOKBACK_DAYS", "3"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,6 +56,9 @@ def init_db() -> sqlite3.Connection:
 
     conn = sqlite3.connect(str(MEMORY_DB))
     conn.row_factory = sqlite3.Row
+    had_processed_days = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='processed_days'"
+    ).fetchone() is not None
 
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS episodes (
@@ -78,6 +85,11 @@ def init_db() -> sqlite3.Connection:
             updated_at TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS processed_days (
+            day TEXT PRIMARY KEY,
+            processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE TABLE IF NOT EXISTS patterns (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             agent TEXT NOT NULL,
@@ -96,6 +108,16 @@ def init_db() -> sqlite3.Connection:
     """)
 
     _migrate_episode_columns(conn)
+
+    if not had_processed_days:
+        # First run with day tracking: earlier versions processed only
+        # "yesterday" each night, so every day before yesterday inside the
+        # lookback window was already handled. Seed those as processed or
+        # the first lookback run would insert their episodes a second time.
+        today = datetime.now(timezone.utc).date()
+        for offset in range(2, LOOKBACK_DAYS + 1):
+            day = (today - timedelta(days=offset)).strftime("%Y-%m-%d")
+            conn.execute("INSERT OR IGNORE INTO processed_days (day) VALUES (?)", (day,))
 
     conn.commit()
     return conn
@@ -148,15 +170,13 @@ def _migrate_episode_columns(conn: sqlite3.Connection) -> None:
     )
 
 
-def read_previous_day_messages() -> list:
-    """Read messages from previous day's JSONL files."""
-    yesterday = datetime.now(timezone.utc) - timedelta(days=1)
-    date_str = yesterday.strftime("%Y-%m-%d")
-
+def read_day_messages(date_str: str) -> list | None:
+    """Read one day's JSONL message file. Returns None if the file does not
+    exist (distinct from an existing-but-empty file, which returns [])."""
     messages_file = MESSAGES_DIR / f"messages-{date_str}.jsonl"
     if not messages_file.exists():
         log.info(f"No messages file for {date_str}")
-        return []
+        return None
 
     messages = []
     with open(messages_file, 'r') as f:
@@ -169,6 +189,30 @@ def read_previous_day_messages() -> list:
 
     log.info(f"Read {len(messages)} messages from {date_str}")
     return messages
+
+
+def read_previous_day_messages() -> list:
+    """Read messages from previous day's JSONL files."""
+    yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+    return read_day_messages(yesterday.strftime("%Y-%m-%d")) or []
+
+
+def unprocessed_days(conn: sqlite3.Connection) -> list:
+    """UTC date strings within the lookback window (yesterday back
+    `LOOKBACK_DAYS` days, oldest first) that have a message file and are not
+    yet recorded in `processed_days`. Today is excluded (still being written)."""
+    today = datetime.now(timezone.utc).date()
+    days = []
+    for offset in range(LOOKBACK_DAYS, 0, -1):
+        day = (today - timedelta(days=offset)).strftime("%Y-%m-%d")
+        if not (MESSAGES_DIR / f"messages-{day}.jsonl").exists():
+            continue
+        done = conn.execute(
+            "SELECT 1 FROM processed_days WHERE day = ?", (day,)
+        ).fetchone()
+        if not done:
+            days.append(day)
+    return days
 
 
 SCORE_TIMEOUT_FIRST = float(os.environ.get("MEMORY_SCORE_TIMEOUT", "20"))
@@ -272,7 +316,14 @@ def create_episode_summary(messages: list) -> str:
     for msg in messages[:10]:  # Limit to first 10 messages
         author = msg.get("author_name", "User")
         content = msg.get("content", "")
-        if content and not msg.get("is_bot", False):
+        if not content:
+            continue
+        # Bot messages are the agents' own replies and decisions; keep them
+        # (labelled) so the episode records what the agent said, not only
+        # what it was told.
+        if msg.get("is_bot", False):
+            texts.append(f"[agent] {author}: {content}")
+        else:
             texts.append(f"{author}: {content}")
 
     return " | ".join(texts)[:500]  # Cap at 500 chars
@@ -454,7 +505,7 @@ def write_health(success: bool, stats: dict) -> None:
 
 
 def process_messages_to_episodes(conn: sqlite3.Connection, stats: dict | None = None) -> tuple[int, list]:
-    """Process yesterday's messages into episodes.
+    """Process unprocessed message days (last LOOKBACK_DAYS) into episodes.
 
     Returns (created_count, new_episodes) where new_episodes is a list of
     {"id", "summary", "channel"} dicts for episodes created *this run* —
@@ -466,33 +517,36 @@ def process_messages_to_episodes(conn: sqlite3.Connection, stats: dict | None = 
     failure that falls all the way back to a default gets counted in the
     run's health stats (`score_failures`).
     """
-    messages = read_previous_day_messages()
-    if not messages:
-        return 0, []
-
-    episodes = segment_messages_into_episodes(messages)
     created = 0
     new_episodes = []
 
-    for episode_msgs in episodes:
-        if not episode_msgs:
-            continue
+    for day in unprocessed_days(conn):
+        messages = read_day_messages(day) or []
+        for episode_msgs in segment_messages_into_episodes(messages):
+            if not episode_msgs:
+                continue
 
-        summary = create_episode_summary(episode_msgs)
-        importance = score_importance(summary, stats)
+            summary = create_episode_summary(episode_msgs)
+            if not summary:
+                continue
+            importance = score_importance(summary, stats)
 
-        # Extract metadata
-        channel = episode_msgs[0].get("channel_name", "unknown")
-        created_at = episode_msgs[0].get("ts", datetime.now(timezone.utc).isoformat())
+            channel = episode_msgs[0].get("channel_name", "unknown")
+            created_at = episode_msgs[0].get("ts", datetime.now(timezone.utc).isoformat())
 
-        cursor = conn.execute(
-            """INSERT INTO episodes
-               (summary, importance, base_importance, channel, created_at, inserted_at)
-               VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
-            (summary, importance, importance, channel, created_at)
-        )
-        new_episodes.append({"id": cursor.lastrowid, "summary": summary, "channel": channel})
-        created += 1
+            cursor = conn.execute(
+                """INSERT INTO episodes
+                   (summary, importance, base_importance, channel, created_at, inserted_at)
+                   VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                (summary, importance, importance, channel, created_at)
+            )
+            new_episodes.append({"id": cursor.lastrowid, "summary": summary, "channel": channel})
+            created += 1
+
+        # Episodes and the processed marker commit together, so a crash
+        # mid-day re-processes that day instead of double-inserting.
+        conn.execute("INSERT OR IGNORE INTO processed_days (day) VALUES (?)", (day,))
+        conn.commit()
 
     conn.commit()
     log.info(f"Created {created} episodes from messages")

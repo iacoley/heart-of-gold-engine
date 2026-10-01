@@ -222,3 +222,137 @@ class TestProcessMessagesToEpisodesReturnShape:
             assert new_episodes == []
         finally:
             conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Own messages in summaries, multi-day lookback, decay and prune
+# ---------------------------------------------------------------------------
+
+import datetime as _dt
+
+
+def _day(offset):
+    return (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=offset)).strftime("%Y-%m-%d")
+
+
+def _write_day(tmp_workspace, offset, text="hello", is_bot=False):
+    d = tmp_workspace / "data" / "messages"
+    d.mkdir(parents=True, exist_ok=True)
+    day = _day(offset)
+    (d / f"messages-{day}.jsonl").write_text(json.dumps({
+        "ts": f"{day}T12:00:00+00:00", "author_name": "Ian", "content": text,
+        "is_bot": is_bot, "channel_name": "general",
+    }) + "\n")
+    return day
+
+
+class TestOwnMessagesInSummary:
+    def test_bot_messages_included_and_labelled(self, mm):
+        summary = mm.create_episode_summary([
+            {"author_name": "Ian", "content": "Ship it?", "is_bot": False},
+            {"author_name": "Marvin", "content": "Decision: shipping.", "is_bot": True},
+        ])
+        assert "Ian: Ship it?" in summary
+        assert "[agent] Marvin: Decision: shipping." in summary
+
+    def test_empty_content_skipped(self, mm):
+        assert mm.create_episode_summary([{"author_name": "Bot", "content": "", "is_bot": True}]) == ""
+
+
+class TestMultiDayLookback:
+    def test_processes_missed_days_once(self, mm, tmp_workspace, monkeypatch):
+        monkeypatch.setattr(mm, "score_importance", lambda s, stats=None: 7.0)
+        _write_day(tmp_workspace, 1, "day one")
+        _write_day(tmp_workspace, 2, "day two")
+        conn = mm.init_db()
+        try:
+            # init_db seeds day-2/day-3 as processed on a brand-new table; clear
+            # to simulate a missed nightly run with tracking already in place.
+            conn.execute("DELETE FROM processed_days")
+            conn.commit()
+            count, new = mm.process_messages_to_episodes(conn)
+            assert count == 2
+            assert [r[0] for r in conn.execute("SELECT summary FROM episodes ORDER BY id")] == [
+                "Ian: day two", "Ian: day one"]
+            count2, new2 = mm.process_messages_to_episodes(conn)
+            assert (count2, new2) == (0, [])
+            assert conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0] == 2
+        finally:
+            conn.close()
+
+    def test_ignores_today_and_days_beyond_window(self, mm, tmp_workspace, monkeypatch):
+        monkeypatch.setattr(mm, "score_importance", lambda s, stats=None: 7.0)
+        _write_day(tmp_workspace, 0, "today")
+        _write_day(tmp_workspace, 4, "too old")
+        conn = mm.init_db()
+        try:
+            assert mm.process_messages_to_episodes(conn) == (0, [])
+        finally:
+            conn.close()
+
+    def test_first_run_seeds_older_days_to_avoid_double_insert(self, mm, tmp_workspace, monkeypatch):
+        monkeypatch.setattr(mm, "score_importance", lambda s, stats=None: 7.0)
+        _write_day(tmp_workspace, 2, "already handled by old code")
+        _write_day(tmp_workspace, 1, "yesterday")
+        conn = mm.init_db()
+        try:
+            count, _ = mm.process_messages_to_episodes(conn)
+            assert count == 1
+        finally:
+            conn.close()
+
+
+class TestDecayAndPrune:
+    def _add(self, conn, importance, age_days, inserted_days_ago, base=None):
+        created = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=age_days)).isoformat()
+        inserted = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=inserted_days_ago)
+                    ).strftime("%Y-%m-%d %H:%M:%S")
+        cur = conn.execute(
+            "INSERT INTO episodes (summary, importance, base_importance, created_at, inserted_at) "
+            "VALUES ('s', ?, ?, ?, ?)",
+            (importance, base if base is not None else importance, created, inserted))
+        conn.commit()
+        return cur.lastrowid
+
+    def test_decay_is_linear_from_base_and_idempotent(self, mm, conn):
+        eid = self._add(conn, 9.0, age_days=8, inserted_days_ago=8)
+        mm.decay_importance(conn)
+        imp = conn.execute("SELECT importance FROM episodes WHERE id=?", (eid,)).fetchone()[0]
+        assert imp == pytest.approx(9.0 - (8 / 4.0) * mm.DECAY_RATE, abs=0.01)
+        mm.decay_importance(conn)
+        again = conn.execute("SELECT importance FROM episodes WHERE id=?", (eid,)).fetchone()[0]
+        assert again == pytest.approx(imp, abs=0.01)
+
+    def test_decay_skips_rows_at_or_below_cutoff(self, mm, conn):
+        eid = self._add(conn, mm.IMPORTANCE_CUTOFF, age_days=40, inserted_days_ago=40)
+        assert mm.decay_importance(conn) == 0
+        assert conn.execute("SELECT importance FROM episodes WHERE id=?", (eid,)).fetchone()[0] == mm.IMPORTANCE_CUTOFF
+
+    def test_decay_floors_at_zero(self, mm, conn):
+        eid = self._add(conn, 7.0, age_days=4000, inserted_days_ago=1)
+        mm.decay_importance(conn)
+        assert conn.execute("SELECT importance FROM episodes WHERE id=?", (eid,)).fetchone()[0] == 0.0
+
+    def test_prune_deletes_old_low_importance(self, mm, conn):
+        eid = self._add(conn, 2.0, age_days=30, inserted_days_ago=30)
+        assert mm.prune_low_importance(conn, grace_days=7) == 1
+        assert conn.execute("SELECT COUNT(*) FROM episodes WHERE id=?", (eid,)).fetchone()[0] == 0
+
+    def test_prune_grace_period_protects_fresh_rows(self, mm, conn):
+        eid = self._add(conn, 2.0, age_days=30, inserted_days_ago=1)
+        assert mm.prune_low_importance(conn, grace_days=7) == 0
+        assert conn.execute("SELECT COUNT(*) FROM episodes WHERE id=?", (eid,)).fetchone()[0] == 1
+
+    def test_prune_keeps_rows_at_or_above_cutoff(self, mm, conn):
+        self._add(conn, mm.IMPORTANCE_CUTOFF, age_days=30, inserted_days_ago=30)
+        assert mm.prune_low_importance(conn, grace_days=7) == 0
+
+    def test_prune_default_grace_from_module_constant(self, mm, conn, monkeypatch):
+        monkeypatch.setattr(mm, "MEMORY_PRUNE_GRACE_DAYS", 100)
+        self._add(conn, 2.0, age_days=30, inserted_days_ago=30)
+        assert mm.prune_low_importance(conn) == 0
+
+    def test_prune_skips_null_inserted_at(self, mm, conn):
+        conn.execute("INSERT INTO episodes (summary, importance, inserted_at) VALUES ('s', 1.0, NULL)")
+        conn.commit()
+        assert mm.prune_low_importance(conn, grace_days=0) == 0

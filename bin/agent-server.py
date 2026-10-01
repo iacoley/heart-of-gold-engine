@@ -2017,7 +2017,16 @@ def load_memory_index(agent: str) -> str:
         return ""
 
 
-def load_stored_facts(agent: str = "", limit: int = 50) -> str:
+# Character budget for the facts block injected into the system prompt.
+STORED_FACTS_CHAR_BUDGET = 6000
+
+
+def _fact_subject_key(subject: str) -> str:
+    """Normalized subject used to dedup DB rows against candidate-file lines."""
+    return " ".join(subject.lower().split())
+
+
+def load_stored_facts(agent: str = "", limit: int = 50, char_budget: int = STORED_FACTS_CHAR_BUDGET) -> str:
     """Load learned facts from SQLite facts table and memory candidates into prompt.
 
     Provides the missing retrieval loop for durable memory: facts recorded live
@@ -2025,12 +2034,20 @@ def load_stored_facts(agent: str = "", limit: int = 50) -> str:
     into the agent's --append-system-prompt at startup/resume so learned
     knowledge persists across session resets without requiring manual edits to
     static files. Also checks data/memory-candidates/ if available.
+
+    Facts are ranked by confidence (when the column exists) then recency, and
+    the block is capped at `char_budget` characters. When facts are dropped by
+    the cap or `limit`, a trailing line says how many were omitted. `agent` is
+    accepted for call-site compatibility; the facts table is not per-agent.
     """
     facts_lines = []
+    seen_subjects = set()
+    omitted = 0
 
     # 1. Query SQLite memory.db if available
     db_path = WORKSPACE_ROOT / "data" / "memory" / "memory.db"
     if db_path.exists():
+        conn = None
         try:
             import sqlite3
             conn = sqlite3.connect(db_path, timeout=5.0)
@@ -2039,31 +2056,60 @@ def load_stored_facts(agent: str = "", limit: int = 50) -> str:
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='facts'"
             ).fetchone()
             if table_check:
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(facts)").fetchall()}
+                order = "confidence DESC, id DESC" if "confidence" in cols else "id DESC"
+                total = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
                 rows = conn.execute(
-                    "SELECT subject, content, domain FROM facts ORDER BY id DESC LIMIT ?",
-                    (limit,)
+                    f"SELECT subject, content, domain FROM facts ORDER BY {order}"
                 ).fetchall()
+                used = 0
+                kept = 0
                 for r in rows:
+                    if kept >= limit:
+                        break
                     domain_tag = f" [{r['domain']}]" if r["domain"] and r["domain"] != "general" else ""
-                    facts_lines.append(f"- **{r['subject']}{domain_tag}:** {r['content']}")
-            conn.close()
+                    line = f"- **{r['subject']}{domain_tag}:** {r['content']}"
+                    if used + len(line) + 1 > char_budget:
+                        break
+                    facts_lines.append(line)
+                    seen_subjects.add(_fact_subject_key(r["subject"]))
+                    used += len(line) + 1
+                    kept += 1
+                omitted = total - kept
         except Exception as e:
             log.warning(f"Failed to load facts from {db_path}: {e}")
+        finally:
+            if conn is not None:
+                conn.close()
 
     # 2. Check recent candidates if DB had few or no facts
-    if len(facts_lines) < 10:
+    if len(facts_lines) < 10 and omitted == 0:
         candidates_dir = WORKSPACE_ROOT / "data" / "memory-candidates"
         if candidates_dir.exists():
             try:
+                import re
                 candidate_files = sorted(candidates_dir.glob("*.md"), reverse=True)[:3]
+                used = sum(len(l) + 1 for l in facts_lines)
                 for cf in candidate_files:
                     try:
                         content = cf.read_text().strip()
                         for line in content.splitlines():
-                            if line.startswith("- **") and line not in facts_lines:
-                                facts_lines.append(line)
-                                if len(facts_lines) >= limit:
-                                    break
+                            if not line.startswith("- **"):
+                                continue
+                            # Candidate lines: "- **subj** (domain): ..." or
+                            # "- **subj:** ..."; DB lines: "- **subj [domain]:** ...".
+                            m = re.match(r"- \*\*(.+?)\*\*", line)
+                            subj = m.group(1) if m else ""
+                            subj = re.sub(r"\s*\[[^\]]*\]\s*:?\s*$|:\s*$", "", subj)
+                            key = _fact_subject_key(subj)
+                            if key in seen_subjects:
+                                continue
+                            if len(facts_lines) >= limit or used + len(line) + 1 > char_budget:
+                                omitted += 1
+                                continue
+                            seen_subjects.add(key)
+                            facts_lines.append(line)
+                            used += len(line) + 1
                     except Exception:
                         pass
             except Exception as e:
@@ -2073,7 +2119,10 @@ def load_stored_facts(agent: str = "", limit: int = 50) -> str:
         return ""
 
     header = "# Learned Facts & Persistent Memory\n\nDurable knowledge recorded from previous interactions:"
-    return header + "\n\n" + "\n".join(facts_lines[:limit])
+    body = "\n".join(facts_lines)
+    if omitted > 0:
+        body += f"\n({omitted} older facts not shown; use the memory tool to search)"
+    return header + "\n\n" + body
 
 
 def load_onboarding_prompt(agent: str) -> str:

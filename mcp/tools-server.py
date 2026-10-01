@@ -61,13 +61,13 @@ CORE_TOOLS = [
     },
     {
         "name": "memory",
-        "description": "Query and write memory. Actions: recall (search episodes), facts (search facts), recent (recent episodes), remember (write one fact to the facts table).",
+        "description": "Query and write memory. Actions: recall (search episodes), facts (search facts), recent (recent episodes), remember (upsert one fact by subject+domain), update (change an existing fact), forget (delete a fact by subject[, domain]).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["recall", "facts", "recent", "remember"],
+                    "enum": ["recall", "facts", "recent", "remember", "update", "forget"],
                     "description": "The action to perform"
                 },
                 "query": {
@@ -80,11 +80,11 @@ CORE_TOOLS = [
                 },
                 "subject": {
                     "type": "string",
-                    "description": "Who/what the fact is about (required for remember)"
+                    "description": "Who/what the fact is about (required for remember, update and forget)"
                 },
                 "content": {
                     "type": "string",
-                    "description": "The fact itself (required for remember, must be non-empty)"
+                    "description": "The fact itself (required for remember and update, must be non-empty)"
                 },
                 "confidence": {
                     "type": "number",
@@ -92,7 +92,7 @@ CORE_TOOLS = [
                 },
                 "domain": {
                     "type": "string",
-                    "description": "Category for the fact (remember only, default 'general')"
+                    "description": "Category for the fact (remember/update/forget; default 'general' for remember and update; forget without a domain deletes that subject in every domain)"
                 }
             },
             "required": ["action"]
@@ -339,6 +339,137 @@ def validate_args(args: dict, schema: dict) -> str | None:
 # Tool Dispatch
 # =============================================================================
 
+def _memory_action(conn, action: str, args: dict) -> dict:
+    """Run one `memory` tool action against an open connection. The caller
+    owns the connection and closes it on every path."""
+    conn.row_factory = sqlite3.Row
+    limit = args.get("limit", 10)
+
+    if action == "recent":
+        rows = conn.execute(
+            "SELECT id, summary, importance, created_at FROM episodes "
+            "ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return {"episodes": [dict(r) for r in rows]}
+
+    elif action == "recall":
+        query = args.get("query", "")
+        rows = conn.execute(
+            "SELECT id, summary, importance, created_at FROM episodes "
+            "WHERE summary LIKE ? ORDER BY importance DESC LIMIT ?",
+            (f"%{query}%", limit)
+        ).fetchall()
+        return {"episodes": [dict(r) for r in rows]}
+
+    elif action == "facts":
+        query = args.get("query", "")
+        rows = conn.execute(
+            "SELECT id, subject, content, confidence, domain FROM facts "
+            "WHERE content LIKE ? OR subject LIKE ? LIMIT ?",
+            (f"%{query}%", f"%{query}%", limit)
+        ).fetchall()
+        return {"facts": [dict(r) for r in rows]}
+
+    elif action in ("remember", "update", "forget"):
+        return _memory_write(conn, action, args)
+
+    return {"error": f"Unknown memory action: {action}"}
+
+
+_FACTS_DDL = """
+    CREATE TABLE IF NOT EXISTS facts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        subject TEXT NOT NULL,
+        content TEXT NOT NULL,
+        confidence REAL DEFAULT 0.8,
+        domain TEXT DEFAULT 'general',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP
+    )
+"""
+
+
+def _memory_write(conn, action: str, args: dict) -> dict:
+    """`remember` (upsert on subject+domain), `update`, and `forget`.
+
+    `remember` is the only production write path into `facts`. It used to
+    INSERT unconditionally, so re-remembering a fact piled up duplicates.
+    Now a matching (subject, domain) row is updated in place.
+    """
+    subject = (args.get("subject") or "").strip()
+    if not subject:
+        return {"error": f"{action} requires a non-empty 'subject'"}
+    raw_domain = (args.get("domain") or "").strip()
+    domain = raw_domain or "general"
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Guarded create: a memory.db from before facts existed (or a fresh one
+    # this call is the first write to) gets the same schema
+    # bin/memory-maintenance.py creates.
+    conn.execute(_FACTS_DDL)
+
+    if action == "forget":
+        if raw_domain:
+            cur = conn.execute(
+                "DELETE FROM facts WHERE subject = ? AND domain = ?", (subject, domain))
+        else:
+            cur = conn.execute("DELETE FROM facts WHERE subject = ?", (subject,))
+        conn.commit()
+        return {"status": "ok", "deleted": cur.rowcount, "subject": subject}
+
+    content = (args.get("content") or "").strip()
+    if not content:
+        return {"error": f"{action} requires non-empty 'content'"}
+
+    confidence = args.get("confidence", 0.8)
+    try:
+        confidence = float(confidence)
+    except (TypeError, ValueError):
+        return {"error": "'confidence' must be a number"}
+    confidence = max(0.0, min(1.0, confidence))
+
+    existing = conn.execute(
+        "SELECT id, confidence FROM facts WHERE subject = ? AND domain = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (subject, domain),
+    ).fetchone()
+
+    if action == "update" and not existing:
+        return {"error": f"no fact found for subject {subject!r} in domain {domain!r}"}
+
+    if existing:
+        fact_id = existing["id"]
+        if "confidence" not in args and existing["confidence"] is not None:
+            confidence = existing["confidence"]  # keep the stored score unless told otherwise
+        conn.execute(
+            "UPDATE facts SET content = ?, confidence = ?, updated_at = ? WHERE id = ?",
+            (content, confidence, now, fact_id),
+        )
+        # Collapse any duplicates left over from before upsert existed.
+        conn.execute(
+            "DELETE FROM facts WHERE subject = ? AND domain = ? AND id != ?",
+            (subject, domain, fact_id),
+        )
+        status = "updated"
+    else:
+        cursor = conn.execute(
+            "INSERT INTO facts (subject, content, confidence, domain, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (subject, content, confidence, domain, now),
+        )
+        fact_id = cursor.lastrowid
+        status = "ok"
+    conn.commit()
+    return {
+        "status": status,
+        "id": fact_id,
+        "subject": subject,
+        "content": content,
+        "confidence": confidence,
+        "domain": domain,
+    }
+
+
 def handle_core_tool(tool_name: str, args: dict) -> dict:
     """Handle built-in core tools."""
 
@@ -431,89 +562,10 @@ def handle_core_tool(tool_name: str, args: dict) -> dict:
         memory_db.parent.mkdir(parents=True, exist_ok=True)
 
         conn = sqlite3.connect(str(memory_db))
-        conn.row_factory = sqlite3.Row
-        limit = args.get("limit", 10)
-
-        if action == "recent":
-            rows = conn.execute(
-                "SELECT id, summary, importance, created_at FROM episodes "
-                "ORDER BY created_at DESC LIMIT ?", (limit,)
-            ).fetchall()
-            return {"episodes": [dict(r) for r in rows]}
-
-        elif action == "recall":
-            query = args.get("query", "")
-            rows = conn.execute(
-                "SELECT id, summary, importance, created_at FROM episodes "
-                "WHERE summary LIKE ? ORDER BY importance DESC LIMIT ?",
-                (f"%{query}%", limit)
-            ).fetchall()
-            return {"episodes": [dict(r) for r in rows]}
-
-        elif action == "facts":
-            query = args.get("query", "")
-            rows = conn.execute(
-                "SELECT id, subject, content, confidence, domain FROM facts "
-                "WHERE content LIKE ? OR subject LIKE ? LIMIT ?",
-                (f"%{query}%", f"%{query}%", limit)
-            ).fetchall()
-            return {"facts": [dict(r) for r in rows]}
-
-        elif action == "remember":
-            # The only production write path into `facts`. Before this,
-            # `git grep -n "INSERT INTO facts"` turned up nothing outside
-            # test fixtures — the table existed but nothing ever wrote to
-            # it, so a fact an agent learned mid-conversation had nowhere
-            # durable to go.
-            subject = (args.get("subject") or "").strip()
-            content = (args.get("content") or "").strip()
-            if not subject:
-                return {"error": "remember requires a non-empty 'subject'"}
-            if not content:
-                return {"error": "remember requires non-empty 'content'"}
-
-            confidence = args.get("confidence", 0.8)
-            try:
-                confidence = float(confidence)
-            except (TypeError, ValueError):
-                return {"error": "'confidence' must be a number"}
-            confidence = max(0.0, min(1.0, confidence))
-
-            domain = (args.get("domain") or "general").strip() or "general"
-
-            # Guarded create: a memory.db from before facts existed
-            # (or a fresh one this call is the first write to) still
-            # gets a table with the exact schema bin/memory-maintenance.py
-            # creates, rather than an OperationalError on first remember.
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS facts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    subject TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    confidence REAL DEFAULT 0.8,
-                    domain TEXT DEFAULT 'general',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP
-                )
-            """)
-
-            cursor = conn.execute(
-                "INSERT INTO facts (subject, content, confidence, domain, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (subject, content, confidence, domain,
-                 datetime.now(timezone.utc).isoformat())
-            )
-            conn.commit()
-            return {
-                "status": "ok",
-                "id": cursor.lastrowid,
-                "subject": subject,
-                "content": content,
-                "confidence": confidence,
-                "domain": domain,
-            }
-
-        conn.close()
+        try:
+            return _memory_action(conn, action, args)
+        finally:
+            conn.close()
 
     elif tool_name == "discord":
         action = args.get("action", "channels")
