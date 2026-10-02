@@ -604,24 +604,38 @@ def handle_core_tool(tool_name: str, args: dict) -> dict:
         elif action == "history":
             channel = args.get("channel", "general")
             limit = min(args.get("limit", 20), 50)
-            # Read from JSONL capture
-            today = datetime.now().strftime("%Y-%m-%d")
-            log_path = WORKSPACE / "data" / "messages" / f"messages-{today}.jsonl"
-            if not log_path.exists():
-                return {"messages": [], "channel": channel}
-            messages = []
-            for line in log_path.read_text().strip().split("\n"):
-                try:
-                    msg = json.loads(line)
+            # Read from JSONL capture. Files are named by UTC date (shared
+            # helper in bin/capture.py); also read yesterday's file when
+            # today's alone doesn't satisfy the limit (e.g. just after UTC
+            # midnight), newest last.
+            bin_dir = str(Path(__file__).resolve().parent.parent / "bin")
+            if bin_dir not in sys.path:
+                sys.path.insert(0, bin_dir)
+            from capture import utc_date_str
+            msg_dir = WORKSPACE / "data" / "messages"
+
+            def _read_day(date_str):
+                path = msg_dir / f"messages-{date_str}.jsonl"
+                if not path.exists():
+                    return []
+                out = []
+                for line in path.read_text().strip().split("\n"):
+                    try:
+                        msg = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
                     if msg.get("channel_name") == channel:
-                        messages.append({
+                        out.append({
                             "ts": msg.get("ts", ""),
                             "author": msg.get("author_name", ""),
                             "content": msg.get("content", "")[:500],
                             "is_bot": msg.get("is_bot", False),
                         })
-                except json.JSONDecodeError:
-                    continue
+                return out
+
+            messages = _read_day(utc_date_str())
+            if len(messages) < limit:
+                messages = _read_day(utc_date_str(-1)) + messages
             return {"messages": messages[-limit:], "channel": channel}
         elif action == "online":
             return {"error": "Online member list requires Discord API access"}

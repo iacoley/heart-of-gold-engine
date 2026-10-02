@@ -15,7 +15,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 WORKSPACE = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
@@ -24,6 +24,16 @@ MESSAGES_DIR = WORKSPACE / "data" / "messages"
 
 def ensure_dirs():
     MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def utc_date_str(offset_days: int = 0) -> str:
+    """UTC calendar date (YYYY-MM-DD) used to name daily message files.
+
+    Every writer and reader of data/messages/messages-*.jsonl must use this
+    (or an equivalent explicit-UTC date): processes run under different local
+    timezones, so naive datetime.now() makes them disagree on the filename.
+    """
+    return (datetime.now(timezone.utc) + timedelta(days=offset_days)).strftime("%Y-%m-%d")
 
 
 def log_path_for_date(date_str: str) -> Path:
