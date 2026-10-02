@@ -29,6 +29,7 @@ from typing import Optional, Dict, List
 from logging.handlers import RotatingFileHandler
 
 from reply_gate import Decision, GateMessage, ReplyGate, SCORER_PROMPT
+from capture import utc_date_str
 from handoff import parse_handoff, required_but_misdirected
 from outbox import add_pending
 import context_box
@@ -1888,7 +1889,7 @@ class DiscordAdapter(discord.Client):
         }
 
         # Write to daily JSONL
-        date_str = datetime.now().strftime("%Y-%m-%d")
+        date_str = utc_date_str()  # UTC, shared with readers (capture.py)
         log_file = MESSAGES_DIR / f"messages-{date_str}.jsonl"
         log_file.parent.mkdir(parents=True, exist_ok=True)
 
