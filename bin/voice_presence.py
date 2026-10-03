@@ -393,7 +393,7 @@ Rewrite it so it reads like Marvin. Keep every fact, number, and claim exactly a
 add nothing, drop nothing, don't hedge or soften anything that was stated plainly. Keep it
 roughly the same length. The text contains placeholder tokens that look like ⟦P0⟧, ⟦P1⟧,
 etc. They stand in for mentions, code, and links. Copy every placeholder token through
-VERBATIM, exactly once each, in a sensible position. Never alter, drop, duplicate, expand,
+VERBATIM, exactly once each, in their original order (⟦P0⟧ before ⟦P1⟧, and so on). Never alter, drop, duplicate, expand,
 or invent a placeholder, and never write your own @mentions. Output ONLY the rewritten reply, no preamble, no quotes around it,
 no note about what you changed.
 
@@ -451,10 +451,10 @@ def protect_spans(text: str) -> tuple[str, list[str]]:
 
 def restore_spans(text: str, spans: list[str]) -> Optional[str]:
     """Inverse of protect_spans(). Returns None if the text's placeholders
-    aren't exactly the set protect_spans() produced, each once (missing,
-    duplicated, or unknown placeholder)."""
+    aren't exactly ⟦P0⟧..⟦Pn-1⟧ in ascending order, each once (missing,
+    duplicated, unknown, or reordered placeholder)."""
     found = [int(n) for n in _PLACEHOLDER_RE.findall(text)]
-    if sorted(found) != list(range(len(spans))):
+    if found != list(range(len(spans))):
         return None
     return _PLACEHOLDER_RE.sub(lambda m: spans[int(m.group(1))], text)
 
@@ -468,12 +468,16 @@ def _validate_rewrite(original: str, spans: list[str], rewritten: str) -> tuple[
     (None, short_reason). Never includes message content in the reason."""
     restored = restore_spans(rewritten, spans)
     if restored is None:
-        return None, "placeholder missing, duplicated, or unknown"
+        return None, "placeholder missing, duplicated, unknown, or reordered"
     if Counter(protect_spans(restored)[1]) != Counter(spans):
         return None, "protected spans differ after restore"
-    orig_mentions = set(_MENTION_SHAPED_RE.findall(original))
-    if any(m not in orig_mentions for m in _MENTION_SHAPED_RE.findall(restored)):
-        return None, "new mention-shaped text in rewrite"
+    if Counter(_MENTION_SHAPED_RE.findall(restored)) - Counter(_MENTION_SHAPED_RE.findall(original)):
+        return None, "new or duplicated mention-shaped text in rewrite"
+    for broadcast in ("@everyone", "@here"):
+        if restored.count(broadcast) > original.count(broadcast):
+            return None, "broadcast mention added in rewrite"
+    if len(restored) > 2 * len(original) or len(restored) > 2000:
+        return None, "rewrite too long"
     if "REDACTED" in restored and "REDACTED" not in original:
         return None, "REDACTED marker in rewrite"
     return restored, ""
@@ -493,6 +497,10 @@ async def rewrite_for_voice(text: str, reason: str) -> Optional[str]:
     if not text or not text.strip():
         return None
     if len(text) > REWRITE_MAX_CHARS:
+        return None
+    if text.count("```") % 2:
+        # Unclosed fence: protect_spans() can't protect it, so the model
+        # would see the block raw. Don't rewrite.
         return None
     if "⟦P" in text:
         # Literal placeholder-shaped text in the original would collide
@@ -562,6 +570,8 @@ async def gate_and_rewrite(text: str) -> tuple[str, dict]:
     either and always judges+gates whatever text it's given."""
     if len(text) > REWRITE_MAX_CHARS:
         return text, {"gate_action": "skipped_too_long"}
+    if text.count("```") % 2:
+        return text, {"gate_action": "skipped_unbalanced_fence"}
     if _is_protected_only(protect_spans(text)[0]):
         return text, {"gate_action": "skipped_protected_only"}
     judge_result = await judge_voice_presence(text)

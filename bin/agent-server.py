@@ -527,7 +527,7 @@ async def _voice_presence_gate(agent: str, channel: str, text: str) -> str:
         log.info(f"[voice-gate] {agent}/{channel}: rewrote a flagged-flat reply ({meta.get('original_reason')!r})")
     elif action == "rewrite_failed":
         log.info(f"[voice-gate] {agent}/{channel}: flagged flat but rewrite failed, posting original ({meta.get('original_reason')!r})")
-    elif action in ("skipped_too_long", "skipped_protected_only"):
+    elif action in ("skipped_too_long", "skipped_protected_only", "skipped_unbalanced_fence"):
         log.info(f"[voice-gate] {agent}/{channel}: {action}, posting original")
     return gated_text
 

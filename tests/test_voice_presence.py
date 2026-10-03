@@ -535,3 +535,53 @@ def test_rewrite_skipped_when_original_contains_placeholder_shape():
     import asyncio
     import voice_presence as vp
     assert asyncio.run(vp.rewrite_for_voice("literal ⟦P0⟧ in the text", "flat")) is None
+
+
+class TestReviewHardening:
+    def test_swapped_placeholders_rejected(self, vp, monkeypatch):
+        _patch_model(monkeypatch, "⟦P1⟧ approved, ⟦P0⟧ please fix")
+        assert asyncio.run(vp.rewrite_for_voice("<@1> approved, <@2> please fix", "flat")) is None
+
+    def test_in_order_placeholders_accepted(self, vp, monkeypatch):
+        _patch_model(monkeypatch, "⟦P0⟧ approved, as ever, ⟦P1⟧ please fix")
+        out = asyncio.run(vp.rewrite_for_voice("<@1> approved, <@2> please fix", "flat"))
+        assert out == "<@1> approved, as ever, <@2> please fix"
+
+    @pytest.mark.parametrize("bcast", ["@everyone", "@here"])
+    def test_broadcast_added_rejected(self, vp, monkeypatch, bcast):
+        _patch_model(monkeypatch, f"⟦P0⟧ done {bcast}")
+        assert asyncio.run(vp.rewrite_for_voice("<@1> done", "flat")) is None
+
+    def test_broadcast_kept_once_accepted(self, vp, monkeypatch):
+        _patch_model(monkeypatch, "@here, done, I suppose ⟦P0⟧")
+        out = asyncio.run(vp.rewrite_for_voice("@here done <@1>", "flat"))
+        assert out == "@here, done, I suppose <@1>"
+
+    def test_broadcast_duplicated_rejected(self, vp, monkeypatch):
+        _patch_model(monkeypatch, "@here @here done ⟦P0⟧")
+        assert asyncio.run(vp.rewrite_for_voice("@here done <@1>", "flat")) is None
+
+    def test_duplicated_mention_outside_placeholder_rejected(self, vp, monkeypatch):
+        _patch_model(monkeypatch, "⟦P0⟧ done <@1>")
+        assert asyncio.run(vp.rewrite_for_voice("<@1> done", "flat")) is None
+
+    def test_unbalanced_fence_skips_judge_and_rewrite(self, vp, monkeypatch):
+        async def boom(*a, **k):
+            raise AssertionError("no model call expected")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", boom)
+        monkeypatch.setattr(vp, "judge_voice_presence", boom)
+        text = 'Handing off.\n```handoff\n{"to": "zero"}\n'
+        out, meta = asyncio.run(vp.gate_and_rewrite(text))
+        assert out == text
+        assert meta["gate_action"] == "skipped_unbalanced_fence"
+        assert asyncio.run(vp.rewrite_for_voice(text, "flat")) is None
+
+    def test_overlong_rewrite_rejected(self, vp, monkeypatch):
+        _patch_model(monkeypatch, "done " + "very " * 20)
+        assert asyncio.run(vp.rewrite_for_voice("done", "flat")) is None
+
+    def test_over_2000_rewrite_rejected(self, vp):
+        orig = "x" * 1400
+        restored, why = vp._validate_rewrite(orig, [], "y" * 2001)
+        assert restored is None and "long" in why
