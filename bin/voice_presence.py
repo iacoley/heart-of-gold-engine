@@ -494,6 +494,10 @@ async def rewrite_for_voice(text: str, reason: str) -> Optional[str]:
         return None
     if len(text) > REWRITE_MAX_CHARS:
         return None
+    if "⟦P" in text:
+        # Literal placeholder-shaped text in the original would collide
+        # with restore_spans(); not worth escaping for, just don't rewrite.
+        return None
     tokenized, spans = protect_spans(text)
     if _is_protected_only(tokenized):
         return None

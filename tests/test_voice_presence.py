@@ -529,3 +529,9 @@ class TestGateLengthAndProtectedOnly:
         out, meta = asyncio.run(vp.gate_and_rewrite("<@111>  https://example.com"))
         assert out == "<@111>  https://example.com"
         assert meta["gate_action"] == "skipped_protected_only"
+
+
+def test_rewrite_skipped_when_original_contains_placeholder_shape():
+    import asyncio
+    import voice_presence as vp
+    assert asyncio.run(vp.rewrite_for_voice("literal ⟦P0⟧ in the text", "flat")) is None
