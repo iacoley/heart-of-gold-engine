@@ -414,3 +414,118 @@ class TestGateAndRewrite:
         text, meta = asyncio.run(vp.gate_and_rewrite("Task completed successfully."))
         assert text == "Task completed successfully."
         assert meta["gate_action"] == "rewrite_failed"
+
+
+class TestProtectSpans:
+    """task-1790988780: mentions/code/URLs must survive the rewrite."""
+
+    @pytest.mark.parametrize("span", [
+        "<@111>", "<@!111>", "<@&222>", "<#333>", "<:blob:444>", "<a:spin:444>",
+        "<t:1700000000>", "<t:1700000000:R>",
+        "`inline code`", "```\nblock\n```", "```handoff\n{\"a\": 1}\n```",
+        "https://example.com/a?b=c", "<https://example.com/x>",
+    ])
+    def test_each_span_type_round_trips(self, vp, span):
+        text = f"before {span} after"
+        tok, spans = vp.protect_spans(text)
+        assert spans == [span]
+        assert span not in tok
+        assert vp.restore_spans(tok, spans) == text
+
+    def test_url_trailing_punctuation_not_swallowed(self, vp):
+        tok, spans = vp.protect_spans("see https://example.com/x.")
+        assert spans == ["https://example.com/x"]
+        assert tok.endswith("⟦P0⟧.")
+
+    def test_url_inside_code_is_one_span(self, vp):
+        _, spans = vp.protect_spans("`curl https://example.com` ok")
+        assert spans == ["`curl https://example.com`"]
+
+    def test_restore_rejects_missing_duplicate_unknown(self, vp):
+        spans = ["<@1>", "<@2>"]
+        assert vp.restore_spans("⟦P0⟧ ⟦P1⟧", spans) == "<@1> <@2>"
+        assert vp.restore_spans("⟦P0⟧", spans) is None
+        assert vp.restore_spans("⟦P0⟧ ⟦P0⟧ ⟦P1⟧", spans) is None
+        assert vp.restore_spans("⟦P0⟧ ⟦P1⟧ ⟦P2⟧", spans) is None
+
+
+def _patch_model(monkeypatch, reply, captured=None):
+    async def fake_exec(*args, **kwargs):
+        if captured is not None:
+            captured.append(args)
+        return _fake_proc([_result_event(reply)])
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+
+class TestRewriteProtection:
+    def test_successful_rewrite_restores_mentions(self, vp, monkeypatch):
+        captured = []
+        _patch_model(monkeypatch, "⟦P0⟧, it is done. Of course it is. See ⟦P1⟧.", captured)
+        orig = "<@111> the job finished. See https://example.com/r"
+        out = asyncio.run(vp.rewrite_for_voice(orig, "flat"))
+        assert out == "<@111>, it is done. Of course it is. See https://example.com/r."
+        prompt = captured[0][2]
+        assert "<@111>" not in prompt and "⟦P0⟧" in prompt
+
+    @pytest.mark.parametrize("bad", ["@<user2>", "<@REDACTED>"])
+    def test_observed_mangled_mentions_fall_back(self, vp, monkeypatch, bad):
+        _patch_model(monkeypatch, f"Hello {bad}, done.")
+        orig = "Hello <@1468012353206354197>, task done."
+        assert asyncio.run(vp.rewrite_for_voice(orig, "flat")) is None
+
+    def test_model_inventing_mention_rejected(self, vp, monkeypatch):
+        _patch_model(monkeypatch, "⟦P0⟧ done <@999>")
+        assert asyncio.run(vp.rewrite_for_voice("<@111> done", "flat")) is None
+
+    def test_dropped_placeholder_rejected(self, vp, monkeypatch):
+        _patch_model(monkeypatch, "done, I suppose.")
+        assert asyncio.run(vp.rewrite_for_voice("<@111> done", "flat")) is None
+
+    def test_duplicated_placeholder_rejected(self, vp, monkeypatch):
+        _patch_model(monkeypatch, "⟦P0⟧ ⟦P0⟧ done")
+        assert asyncio.run(vp.rewrite_for_voice("<@111> done", "flat")) is None
+
+    def test_handoff_block_preserved_byte_for_byte(self, vp, monkeypatch):
+        block = '```handoff\n{"to": "zero",  "subject": "x"}\n```'
+        _patch_model(monkeypatch, "Handing off, as ever.\n\n⟦P0⟧")
+        out = asyncio.run(vp.rewrite_for_voice(f"Handing off.\n\n{block}", "flat"))
+        assert out.endswith(block)
+
+    def test_protected_only_skips_model(self, vp, monkeypatch):
+        async def boom(*a, **k):
+            raise AssertionError("no model call expected")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", boom)
+        assert asyncio.run(vp.rewrite_for_voice("<@111> <@222>", "flat")) is None
+
+
+class TestGateLengthAndProtectedOnly:
+    def test_too_long_skips_rewrite_and_judge(self, vp, monkeypatch):
+        async def boom(*a, **k):
+            raise AssertionError("no model call expected")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", boom)
+        monkeypatch.setattr(vp, "judge_voice_presence", boom)
+        monkeypatch.setattr(vp, "rewrite_for_voice", boom)
+        text = "x" * (vp.REWRITE_MAX_CHARS + 1)
+        out, meta = asyncio.run(vp.gate_and_rewrite(text))
+        assert out == text
+        assert meta["gate_action"] == "skipped_too_long"
+
+    def test_exactly_max_chars_still_judged(self, vp, monkeypatch):
+        async def fake_judge(text):
+            return {"in_voice": True, "reason": "ok"}
+
+        monkeypatch.setattr(vp, "judge_voice_presence", fake_judge)
+        _, meta = asyncio.run(vp.gate_and_rewrite("x" * vp.REWRITE_MAX_CHARS))
+        assert meta["gate_action"] == "passed"
+
+    def test_protected_only_skips_judge(self, vp, monkeypatch):
+        async def boom(*a, **k):
+            raise AssertionError("no model call expected")
+
+        monkeypatch.setattr(vp, "judge_voice_presence", boom)
+        out, meta = asyncio.run(vp.gate_and_rewrite("<@111>  https://example.com"))
+        assert out == "<@111>  https://example.com"
+        assert meta["gate_action"] == "skipped_protected_only"
